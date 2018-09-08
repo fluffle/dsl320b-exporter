@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
+	"strconv"
 
 	"github.com/golang/glog"
 )
@@ -12,10 +14,10 @@ import (
 // this code, but ugh I appear to have exhausted other options.
 
 type Reader struct {
-	buf  []byte
-	rd   io.Reader // reader provided by the client
-	r, w int       // buf read and write positions
-	err  error
+	buf     []byte
+	rd      io.Reader // reader provided by the client
+	r, p, w int       // buf read, operate and write positions
+	err     error
 }
 
 const (
@@ -30,6 +32,7 @@ var (
 	ErrNegativeCount = errors.New("Reader: negative read/peek size")
 	ErrAdvanceTooFar = errors.New("Reader: tried to advance past write pointer")
 	errNegativeRead  = errors.New("Reader: source returned negative count from Read")
+	errShortRead     = errors.New("Reader: source returned too few bytes")
 )
 
 // NewReader returns a new Reader whose buffer has the default size.
@@ -44,7 +47,7 @@ func NewReader(rd io.Reader) *Reader {
 func (r *Reader) empty() bool { return r.w <= r.r }
 
 // Len returns the number of bytes of the unread portion of the buffer.
-func (r *Reader) Len() int { return r.w - r.r }
+func (r *Reader) Len() int { return r.w - r.p }
 
 // Cap returns the capacity of the buffer's underlying byte slice, that is, the
 // total space allocated for the buffer's data.
@@ -54,7 +57,7 @@ func (r *Reader) Cap() int { return cap(r.buf) }
 // but it retains the underlying storage for use by future writes.
 func (r *Reader) Reset() {
 	r.buf = r.buf[:0]
-	r.r, r.w = 0, 0
+	r.r, r.p, r.w = 0, 0, 0
 }
 
 // tryGrowByReslice is a inlineable version of grow for the fast-case where the
@@ -97,9 +100,22 @@ func (r *Reader) grow(n int) int {
 		r.buf = buf
 	}
 	r.w -= r.r
+	r.p -= r.r
 	r.r = 0
 	r.buf = r.buf[:r.w+n]
 	return r.w
+}
+
+// makeSlice allocates a slice of size n. If the allocation fails, it panics
+// with ErrTooLarge.
+func makeSlice(n int) []byte {
+	// If the make fails, give a known error.
+	defer func() {
+		if recover() != nil {
+			panic(ErrTooLarge)
+		}
+	}()
+	return make([]byte, n)
 }
 
 // fill reads a new chunk into the buffer.
@@ -133,6 +149,17 @@ func (r *Reader) readErr() error {
 	return err
 }
 
+// Done advances the read pointer to the operate pointer, allowing
+// any subsequent fill() calls to drop the data betwen those two points.
+// Code below this point advances the operate pointer as it consumes data
+// from the underlying reader, but can also move that pointer backwards
+// when it encounters unexpected input if necessary. Fixing the read pointer
+// until Done is called ensures that all the data between r.r and r.p will
+// be kept in the buffer until it is no longer needed.
+func (r *Reader) Done() {
+	r.r = r.p
+}
+
 // Peek returns the next n bytes without advancing the reader. The bytes stop
 // being valid at the next read call. If Peek returns fewer than n bytes, it
 // also returns an error explaining why the read is short. The error is
@@ -152,7 +179,7 @@ func (r *Reader) Peek(n int) ([]byte, error) {
 		n = avail
 		err = r.readErr()
 	}
-	return r.buf[r.r : r.r+n], err
+	return r.buf[r.p : r.p+n], err
 }
 
 func (r *Reader) Advance(n int) error {
@@ -162,7 +189,7 @@ func (r *Reader) Advance(n int) error {
 	if n > r.Len() {
 		return ErrAdvanceTooFar
 	}
-	r.r += n
+	r.p += n
 	return nil
 }
 
@@ -174,64 +201,186 @@ func (r *Reader) Consume(n int) ([]byte, error) {
 	return b, r.Advance(n)
 }
 
+func (r *Reader) expectBytes(want []byte) (bool, error) {
+	b, err := r.Peek(len(want))
+	if err != nil {
+		return false, err
+	}
+	if bytes.Equal(b, want) {
+		return true, r.Advance(len(want))
+	}
+	return false, nil
+}
+
+func (r *Reader) ExpectBytes(want []byte) error {
+	ok, err := r.expectBytes(want)
+	if ok {
+		r.Done()
+		return nil
+	}
+	if err == nil {
+		// This peek must succeed otherwise err wouldn't be nil.
+		got, _ := r.Peek(len(want))
+		err = fmt.Errorf("expect: expected %q, got %q", want, got)
+	}
+	return err
+}
+
 func (r *Reader) ReadTo(delim string) ([]byte, error) {
-	return r.until([]byte(delim), false, false)
+	b, err := r.until([]byte(delim), false, false)
+	r.Done()
+	return b, err
 }
 
 func (r *Reader) ReadPast(delim string) ([]byte, error) {
-	return r.until([]byte(delim), true, false)
+	b, err := r.until([]byte(delim), true, false)
+	r.Done()
+	return b, err
 }
 
 func (r *Reader) SeekTo(delim string) error {
 	_, err := r.until([]byte(delim), false, true)
+	r.Done()
 	return err
 }
 
 func (r *Reader) SeekPast(delim string) error {
 	_, err := r.until([]byte(delim), true, true)
+	r.Done()
 	return err
 }
 
 func (r *Reader) until(delim []byte, consume bool, skip bool) (read []byte, err error) {
-	mark := r.r
+	mark := r.p
 	for {
 		// Search the unsearched parts of the buffer.
 		if i := bytes.Index(r.buf[mark:r.w], delim); i >= 0 {
 			if consume {
-				read = r.buf[r.r : mark+i+len(delim)]
-				r.r = mark + i + len(delim)
+				read = r.buf[r.p : mark+i+len(delim)]
+				r.p = mark + i + len(delim)
 			} else {
-				read = r.buf[r.r : mark+i]
-				r.r = mark + i
+				read = r.buf[r.p : mark+i]
+				r.p = mark + i
 			}
 			break
 		}
 
 		// Pending error?
 		if r.err != nil {
-			read = r.buf[r.r:r.w]
-			r.r = r.w
+			read = r.buf[r.p:r.w]
+			r.p = r.w
 			err = r.readErr()
 			break
 		}
 
 		mark = r.w - len(delim) + 1
 		if skip {
-			r.r = mark
+			r.p = mark
+			r.Done()
 		}
 		r.fill() // more data please!
 	}
 	return
 }
 
-// makeSlice allocates a slice of size n. If the allocation fails, it panics
-// with ErrTooLarge.
-func makeSlice(n int) []byte {
-	// If the make fails, give a known error.
-	defer func() {
-		if recover() != nil {
-			panic(ErrTooLarge)
+func (r *Reader) scan(f func(byte) bool) ([]byte, error) {
+	start := r.p
+	b, err := r.Peek(1)
+	for err == nil {
+		if len(b) == 0 {
+			err = errShortRead
+			break
 		}
-	}()
-	return make([]byte, n)
+		if !f(b[0]) {
+			break
+		}
+		r.Advance(1)
+		b, err = r.Peek(1)
+	}
+	return r.buf[start:r.p], err
+}
+
+func (r *Reader) Scan(f func(byte) bool) ([]byte, error) {
+	b, err := r.scan(f)
+	r.Done()
+	return b, err
+}
+
+func IsDigit(b byte) bool {
+	return b >= '0' && b <= '9'
+}
+
+func IsHexDigit(b byte) bool {
+	return IsDigit(b) ||
+		(b >= 'a' && b <= 'f') ||
+		(b >= 'A' && b <= 'F')
+}
+
+// Float64 consumes numbers matching the following regex:
+//   -?[0-9]+(.[0-9]+)?([eE][+-]?[0-9]+)?
+func (r *Reader) Float64() (float64, error) {
+	start := r.p
+	rewind := func(err error) (float64, error) {
+		r.p = start
+		return 0, err
+	}
+	// At a number of points in this function we look for optional further input.
+	// If the data from the underlying socket ends here we'll get io.EOF and
+	// short reads, but we might still have a valid float. This function
+	// handles this case, I hope.
+	tryParseAtEOF := func(err error) (float64, error) {
+		if err == io.EOF {
+			f, err := strconv.ParseFloat(string(r.buf[start:r.p]), 64)
+			if err != nil {
+				return rewind(err)
+			}
+			r.Done()
+			return f, nil
+		}
+		return rewind(err)
+	}
+	scanNumbers := func() error {
+		b, err := r.scan(IsDigit)
+		if err == nil && len(b) == 0 {
+			// Expected >0 digits for valid float, so mimic strconv's error.
+			return strconv.ErrSyntax
+		}
+		return err
+	}
+
+	// Leading -
+	if _, err := r.expectBytes([]byte{'-'}); err != nil {
+		return rewind(err)
+	}
+	// First set of numbers.
+	if err := scanNumbers(); err != nil {
+		return tryParseAtEOF(err)
+	}
+	// Decimal point and optional second set of numbers.
+	if ok, err := r.expectBytes([]byte{'.'}); err != nil {
+		return tryParseAtEOF(err)
+	} else if ok {
+		if err := scanNumbers(); err != nil {
+			return tryParseAtEOF(err)
+		}
+	}
+	// Optional exponent.
+	if b, err := r.Peek(1); err != nil {
+		return tryParseAtEOF(err)
+	} else if b[0] == 'e' || b[0] == 'E' {
+		r.Advance(1)
+		b, err = r.Peek(1)
+		if err != nil {
+			// ParseFloat would fail here because we have exponent at EOF
+			return rewind(err)
+		}
+		if b[0] == '+' || b[0] == '-' {
+			r.Advance(1)
+		}
+		if err = scanNumbers(); err != nil {
+			return tryParseAtEOF(err)
+		}
+	}
+	// Got here, so we should have advanced r.p past a valid-looking float.
+	return tryParseAtEOF(io.EOF)
 }

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"flag"
 	"fmt"
 	"io"
@@ -44,7 +43,6 @@ func (c *Caller) CallTELNET(ctx telnet.Context, w telnet.Writer, r telnet.Reader
 
 func (c *Caller) WriteLine(s string, star ...byte) error {
 	p := []byte(s + "\r\n")
-	glog.V(2).Infof("write: %q", s)
 	_, err := c.w.Write(p)
 	if err != nil {
 		return err
@@ -54,8 +52,9 @@ func (c *Caller) WriteLine(s string, star ...byte) error {
 			p[i] = star[0]
 		}
 	}
+	glog.V(2).Infof("write: %q", p)
 	// Read the bytes we wrote echoed back to us.
-	return c.ExpectBytes(p)
+	return c.r.ExpectBytes(p)
 }
 
 func (c *Caller) SeekPrompt() error {
@@ -63,19 +62,7 @@ func (c *Caller) SeekPrompt() error {
 }
 
 func (c *Caller) Expect(s string) error {
-	return c.ExpectBytes([]byte(s))
-}
-
-func (c *Caller) ExpectBytes(want []byte) error {
-	b, err := c.r.Peek(len(want))
-	if err != nil {
-		return err
-	}
-	if bytes.Equal(b, want) {
-		glog.V(2).Infof("expect: %q", want)
-		return c.r.Advance(len(want))
-	}
-	return fmt.Errorf("expected %q, got %q", want, b)
+	return c.r.ExpectBytes([]byte(s))
 }
 
 type Command interface {
@@ -109,7 +96,7 @@ func (dc *DiagCmd) Run(c *Caller) error {
 		return err
 	}
 
-	out, err := c.r.ReadPast("504~511\r")
+	out, err := c.r.ReadPast("504~511\r\r\n")
 	if err != nil {
 		return err
 	}
@@ -119,6 +106,24 @@ func (dc *DiagCmd) Run(c *Caller) error {
 	if err = c.WriteLine(""); err != nil {
 		return err
 	}
+	return c.SeekPrompt()
+}
+
+type NoiseMarginCmd struct{}
+
+func (nmc *NoiseMarginCmd) Run(c *Caller) error {
+	if err := c.WriteLine("wan adsl l n"); err != nil {
+		return err
+	}
+
+	if err := c.r.SeekPast("noise margin downstream: "); err != nil {
+		return err
+	}
+	dm, err := c.r.Float64()
+	if err != nil {
+		return err
+	}
+	glog.Infof("Downstream noise margin: %g", dm)
 	return c.SeekPrompt()
 }
 
@@ -136,6 +141,7 @@ func main() {
 		Prompt: fmt.Sprintf("\r\n%s> ", *modemName),
 		Cmds: []Command{
 			&LoginCmd{Pass: *modemPass},
+			&NoiseMarginCmd{},
 			&DiagCmd{Out: fh},
 		},
 	}
