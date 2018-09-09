@@ -16,7 +16,7 @@ var (
 	modemPort = flag.Int("modem_port", 23, "Port to telnet to.")
 	modemPass = flag.String("modem_pass", "", "Admin password for the modem.")
 	modemName = flag.String("modem_hostname", "modem", "Hostname for modem.")
-	diagFile  = flag.String("diag_file", "diag.txt", "Dump diag to this file.")
+	diagFile  = flag.String("diag_file", "", "Dump diag to this file.")
 )
 
 type Caller struct {
@@ -41,7 +41,7 @@ func (c *Caller) CallTELNET(ctx telnet.Context, w telnet.Writer, r telnet.Reader
 	}
 }
 
-func (c *Caller) WriteLine(s string, star ...byte) error {
+func (c *Caller) writeLine(s string, star ...byte) error {
 	p := []byte(s + "\r\n")
 	_, err := c.w.Write(p)
 	if err != nil {
@@ -55,6 +55,14 @@ func (c *Caller) WriteLine(s string, star ...byte) error {
 	glog.V(2).Infof("write: %q", p)
 	// Read the bytes we wrote echoed back to us.
 	return c.r.ExpectBytes(p)
+}
+
+func (c *Caller) WriteLine(s string) error {
+	return c.writeLine(s)
+}
+
+func (c *Caller) WritePass(s string) error {
+	return c.writeLine(s, '*')
 }
 
 func (c *Caller) SeekPrompt() error {
@@ -77,7 +85,7 @@ func (lc *LoginCmd) Run(c *Caller) error {
 	if err := c.Expect("\r\nPassword: "); err != nil {
 		return fmt.Errorf("expect password: %v", err)
 	}
-	if err := c.WriteLine(lc.Pass, '*'); err != nil {
+	if err := c.WritePass(lc.Pass); err != nil {
 		return fmt.Errorf("write password: %v", err)
 	}
 	if err := c.SeekPrompt(); err != nil {
@@ -112,19 +120,38 @@ func (dc *DiagCmd) Run(c *Caller) error {
 type NoiseMarginCmd struct{}
 
 func (nmc *NoiseMarginCmd) Run(c *Caller) error {
-	if err := c.WriteLine("wan adsl l n"); err != nil {
+	stats := make(map[string]float64)
+	recordStat := func(k string) error {
+		f, err := c.r.Float64()
+		stats[k] = f
 		return err
 	}
 
-	if err := c.r.SeekPast("noise margin downstream: "); err != nil {
-		return err
+	convo := []struct {
+		f func(string) error
+		c string
+	}{
+		{c.WriteLine, "wan adsl l n"},
+		{c.r.SeekPast, "noise margin downstream: "},
+		{recordStat, "downmargin"},
+		{c.r.SeekPast, "attenuation downstream: "},
+		{recordStat, "downatten"},
+		{c.r.SeekPast, c.Prompt},
+		{c.WriteLine, "wan adsl l f"},
+		{c.r.SeekPast, "noise margin upstream: "},
+		{recordStat, "upmargin"},
+		{c.r.SeekPast, "attenuation upstream: "},
+		{recordStat, "upatten"},
+		{c.r.SeekPast, c.Prompt},
 	}
-	dm, err := c.r.Float64()
-	if err != nil {
-		return err
+
+	for _, s := range convo {
+		if err := s.f(s.c); err != nil {
+			return err
+		}
 	}
-	glog.Infof("Downstream noise margin: %g", dm)
-	return c.SeekPrompt()
+	glog.Infof("%v", stats)
+	return nil
 }
 
 func main() {
@@ -132,20 +159,26 @@ func main() {
 	if *modemIP == "" || *modemPass == "" {
 		glog.Exit("--modem_ip and --modem_pass are both required.")
 	}
-	fh, err := os.OpenFile(*diagFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		glog.Exitf("Couldn't open diag file: %v")
-	}
 
 	caller := &Caller{
 		Prompt: fmt.Sprintf("\r\n%s> ", *modemName),
 		Cmds: []Command{
 			&LoginCmd{Pass: *modemPass},
 			&NoiseMarginCmd{},
-			&DiagCmd{Out: fh},
 		},
 	}
+
+	if *diagFile != "" {
+		fh, err := os.OpenFile(*diagFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			glog.Exitf("Couldn't open diag file: %v", err)
+		}
+		defer fh.Close()
+		caller.Cmds = append(caller.Cmds, &DiagCmd{Out: fh})
+	}
+
 	hp := fmt.Sprintf("%s:%d", *modemIP, *modemPort)
-	telnet.DialToAndCall(hp, caller)
-	fh.Close()
+	if err := telnet.DialToAndCall(hp, caller); err != nil {
+		glog.Exitf("Connection failed: %v", err)
+	}
 }

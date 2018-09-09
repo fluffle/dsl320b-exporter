@@ -254,6 +254,7 @@ func (r *Reader) until(delim []byte, consume bool, skip bool) (read []byte, err 
 	mark := r.p
 	for {
 		// Search the unsearched parts of the buffer.
+		glog.V(2).Infof("r=%d p=%d mark=%d w=%d len=%d", r.r, r.p, mark, r.w, len(r.buf))
 		if i := bytes.Index(r.buf[mark:r.w], delim); i >= 0 {
 			if consume {
 				read = r.buf[r.p : mark+i+len(delim)]
@@ -278,12 +279,18 @@ func (r *Reader) until(delim []byte, consume bool, skip bool) (read []byte, err 
 			r.p = mark
 			r.Done()
 		}
+		before := r.r
 		r.fill() // more data please!
+		if r.r < before {
+			// fill called grow and grow slid the remaining data to
+			// the beginning of the buffer, we need to pull mark back
+			mark -= (before - r.r)
+		}
 	}
 	return
 }
 
-func (r *Reader) scan(f func(byte) bool) ([]byte, error) {
+func (r *Reader) scan(f byteScanner) ([]byte, error) {
 	start := r.p
 	b, err := r.Peek(1)
 	for err == nil {
@@ -300,11 +307,13 @@ func (r *Reader) scan(f func(byte) bool) ([]byte, error) {
 	return r.buf[start:r.p], err
 }
 
-func (r *Reader) Scan(f func(byte) bool) ([]byte, error) {
+func (r *Reader) Scan(f byteScanner) ([]byte, error) {
 	b, err := r.scan(f)
 	r.Done()
 	return b, err
 }
+
+type byteScanner func(byte) bool
 
 func IsDigit(b byte) bool {
 	return b >= '0' && b <= '9'
@@ -383,4 +392,65 @@ func (r *Reader) Float64() (float64, error) {
 	}
 	// Got here, so we should have advanced r.p past a valid-looking float.
 	return tryParseAtEOF(io.EOF)
+}
+
+// Int64 consumes numbers matching the following regex:
+//   -?[0-9]+
+func (r *Reader) Int64() (int64, error) {
+	i, err := r.parseInt(10, 64)
+	if err != nil {
+		return 0, err
+	}
+	r.Done()
+	return i, nil
+}
+
+func (r *Reader) Hex64() (int64, error) {
+	i, err := r.parseInt(16, 64)
+	if err != nil {
+		return 0, err
+	}
+	r.Done()
+	return i, nil
+}
+
+func (r *Reader) parseInt(base int, bitSize int) (int64, error) {
+	start := r.p
+	rewind := func(err error) (int64, error) {
+		r.p = start
+		return 0, err
+	}
+
+	var scanFunc byteScanner
+	switch base {
+	case 10:
+		scanFunc = IsDigit
+		// Leading -
+		if _, err := r.expectBytes([]byte{'-'}); err != nil {
+			return rewind(err)
+		}
+	case 16:
+		scanFunc = IsHexDigit
+		// Leading 0x
+		if _, err := r.expectBytes([]byte("0x")); err != nil {
+			return rewind(err)
+		}
+	default:
+		return 0, fmt.Errorf("invalid base: %d", base)
+	}
+
+	// Numbers!
+	b, err := r.scan(scanFunc)
+	if err != nil && err != io.EOF {
+		return rewind(err)
+	}
+	if len(b) == 0 {
+		// Expected >0 digits for valid int, so mimic strconv's error.
+		return rewind(strconv.ErrSyntax)
+	}
+	i, err := strconv.ParseInt(string(r.buf[start:r.p]), base, bitSize)
+	if err != nil {
+		return rewind(err)
+	}
+	return i, nil
 }
