@@ -14,10 +14,17 @@ import (
 // this code, but ugh I appear to have exhausted other options.
 
 type Reader struct {
-	buf     []byte
-	rd      io.Reader // reader provided by the client
-	r, p, w int       // buf read, operate and write positions
-	err     error
+	buf []byte
+	rd  io.Reader // reader provided by the client
+	err error
+	// buf read, operate and write positions
+	// The invariant 0 <= r <= p <= w <= len(buf) should always hold.
+	r, p, w int
+	// Stack of marker pointers, all markers should be between r and p.
+	// Various nested scanning functions need to remember where they
+	// started scanning from, and these pointers need to stay correct
+	// across calls to fill and grow.
+	m []int
 }
 
 const (
@@ -57,6 +64,7 @@ func (r *Reader) Cap() int { return cap(r.buf) }
 // but it retains the underlying storage for use by future writes.
 func (r *Reader) Reset() {
 	r.buf = r.buf[:0]
+	r.m = r.m[:0]
 	r.r, r.p, r.w = 0, 0, 0
 }
 
@@ -99,8 +107,13 @@ func (r *Reader) grow(n int) int {
 		copy(buf, r.buf[r.r:r.w])
 		r.buf = buf
 	}
+	// We slid the read pointer back to the beginning of the buffer,
+	// so we need to pull all our other pointers backwards.
 	r.w -= r.r
 	r.p -= r.r
+	for i := range r.m {
+		r.m[i] -= r.r
+	}
 	r.r = 0
 	r.buf = r.buf[:r.w+n]
 	return r.w
@@ -150,20 +163,40 @@ func (r *Reader) readErr() error {
 }
 
 // Done advances the read pointer to the operate pointer, allowing
-// any subsequent fill() calls to drop the data betwen those two points.
+// subsequent fill() calls to drop the buffered data before that point.
 // Code below this point advances the operate pointer as it consumes data
 // from the underlying reader, but can also move that pointer backwards
 // when it encounters unexpected input if necessary. Fixing the read pointer
 // until Done is called ensures that all the data between r.r and r.p will
 // be kept in the buffer until it is no longer needed.
+// Done will panic if there are any markers on the marker stack.
 func (r *Reader) Done() {
+	if len(r.m) > 0 {
+		panic("done: advancing read pointer with active markers")
+	}
 	r.r = r.p
 }
 
-// Peek returns the next n bytes without advancing the reader. The bytes stop
-// being valid at the next read call. If Peek returns fewer than n bytes, it
-// also returns an error explaining why the read is short. The error is
-// ErrBufferFull if n is larger than b's buffer size.
+// PushMark pushes the current position of the operate pointer onto the
+// marker stack for later retrieval.
+func (r *Reader) PushMark() {
+	r.m = append(r.m, r.p)
+}
+
+// PopMark removes and returns a previously-pushed marker from the stack.
+func (r *Reader) PopMark() (mark int) {
+	if len(r.m) == 0 {
+		panic("pop mark: no active markers")
+	}
+	l := len(r.m) - 1
+	r.m, mark = r.m[:l], r.m[l]
+	return mark
+}
+
+// Peek returns the next n bytes without advancing the operate pointer.
+// The bytes stop being valid at the next read call. If Peek returns fewer
+// than n bytes, it also returns an error explaining why the read is short.
+// The error is ErrBufferFull if n is larger than b's buffer size.
 func (r *Reader) Peek(n int) ([]byte, error) {
 	if n < 0 {
 		return nil, ErrNegativeCount
@@ -198,7 +231,9 @@ func (r *Reader) Consume(n int) ([]byte, error) {
 	if err != nil {
 		return b, err
 	}
-	return b, r.Advance(n)
+	r.Advance(n)
+	r.Done()
+	return b, nil
 }
 
 func (r *Reader) expectBytes(want []byte) (bool, error) {
@@ -251,47 +286,49 @@ func (r *Reader) SeekPast(delim string) error {
 }
 
 func (r *Reader) until(delim []byte, consume bool, skip bool) (read []byte, err error) {
-	mark := r.p
+	if !skip {
+		r.PushMark()
+	}
 	for {
 		// Search the unsearched parts of the buffer.
-		glog.V(2).Infof("r=%d p=%d mark=%d w=%d len=%d", r.r, r.p, mark, r.w, len(r.buf))
-		if i := bytes.Index(r.buf[mark:r.w], delim); i >= 0 {
+		glog.V(2).Infof("r=%d m=%v p=%d w=%d len=%d", r.r, r.m, r.p, r.w, len(r.buf))
+		if i := bytes.Index(r.buf[r.p:r.w], delim); i >= 0 {
+			r.p += i
 			if consume {
-				read = r.buf[r.p : mark+i+len(delim)]
-				r.p = mark + i + len(delim)
-			} else {
-				read = r.buf[r.p : mark+i]
-				r.p = mark + i
+				r.p += len(delim)
+			}
+			if !skip {
+				mark := r.PopMark()
+				read = r.buf[mark:r.p]
 			}
 			break
 		}
 
+		// We've searched the current buffer so move our operate pointer up.
+		r.p = r.w - len(delim) + 1
+		if skip {
+			// We don't care about the data so advance read pointer.
+			r.Done()
+		}
+
 		// Pending error?
 		if r.err != nil {
-			read = r.buf[r.p:r.w]
-			r.p = r.w
+			if !skip {
+				mark := r.PopMark()
+				// Return everything scanned so far.
+				read = r.buf[mark:r.p]
+			}
 			err = r.readErr()
 			break
 		}
 
-		mark = r.w - len(delim) + 1
-		if skip {
-			r.p = mark
-			r.Done()
-		}
-		before := r.r
 		r.fill() // more data please!
-		if r.r < before {
-			// fill called grow and grow slid the remaining data to
-			// the beginning of the buffer, we need to pull mark back
-			mark -= (before - r.r)
-		}
 	}
 	return
 }
 
 func (r *Reader) scan(f byteScanner) ([]byte, error) {
-	start := r.p
+	r.PushMark()
 	b, err := r.Peek(1)
 	for err == nil {
 		if len(b) == 0 {
@@ -304,7 +341,8 @@ func (r *Reader) scan(f byteScanner) ([]byte, error) {
 		r.Advance(1)
 		b, err = r.Peek(1)
 	}
-	return r.buf[start:r.p], err
+	mark := r.PopMark()
+	return r.buf[mark:r.p], err
 }
 
 func (r *Reader) Scan(f byteScanner) ([]byte, error) {
@@ -328,9 +366,9 @@ func IsHexDigit(b byte) bool {
 // Float64 consumes numbers matching the following regex:
 //   -?[0-9]+(.[0-9]+)?([eE][+-]?[0-9]+)?
 func (r *Reader) Float64() (float64, error) {
-	start := r.p
+	r.PushMark()
 	rewind := func(err error) (float64, error) {
-		r.p = start
+		r.p = r.PopMark()
 		return 0, err
 	}
 	// At a number of points in this function we look for optional further input.
@@ -339,9 +377,11 @@ func (r *Reader) Float64() (float64, error) {
 	// handles this case, I hope.
 	tryParseAtEOF := func(err error) (float64, error) {
 		if err == io.EOF {
-			f, err := strconv.ParseFloat(string(r.buf[start:r.p]), 64)
+			mark := r.PopMark()
+			f, err := strconv.ParseFloat(string(r.buf[mark:r.p]), 64)
 			if err != nil {
-				return rewind(err)
+				r.p = mark
+				return 0, err
 			}
 			r.Done()
 			return f, nil
@@ -415,9 +455,9 @@ func (r *Reader) Hex64() (int64, error) {
 }
 
 func (r *Reader) parseInt(base int, bitSize int) (int64, error) {
-	start := r.p
+	r.PushMark()
 	rewind := func(err error) (int64, error) {
-		r.p = start
+		r.p = r.PopMark()
 		return 0, err
 	}
 
@@ -448,9 +488,11 @@ func (r *Reader) parseInt(base int, bitSize int) (int64, error) {
 		// Expected >0 digits for valid int, so mimic strconv's error.
 		return rewind(strconv.ErrSyntax)
 	}
-	i, err := strconv.ParseInt(string(r.buf[start:r.p]), base, bitSize)
+	mark := r.PopMark()
+	i, err := strconv.ParseInt(string(r.buf[mark:r.p]), base, bitSize)
 	if err != nil {
-		return rewind(err)
+		r.p = mark
+		return 0, err
 	}
 	return i, nil
 }
