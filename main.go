@@ -1,17 +1,20 @@
 package main
 
 import (
-	"bufio"
+	"context"
 	"flag"
 	"fmt"
-	"io"
+	"net/http"
 	"os"
 
 	"github.com/golang/glog"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/reiver/go-telnet"
 )
 
 var (
+	port      = flag.Int("port", 9489, "Port to serve metrics on.")
 	modemIP   = flag.String("modem_ip", "", "Internal IP of the modem.")
 	modemPort = flag.Int("modem_port", 23, "Port to telnet to.")
 	modemPass = flag.String("modem_pass", "", "Admin password for the modem.")
@@ -19,29 +22,25 @@ var (
 	diagFile  = flag.String("diag_file", "", "Dump diag to this file.")
 )
 
-type Caller struct {
-	Prompt string
-	Cmds   []Command
-	cmd    Command
+type Conn struct {
+	Prompt, Pass string
 
-	w telnet.Writer
-	r *Reader
-	s *bufio.Scanner
+	w        *telnet.Conn
+	r        *Reader
+	shutdown bool
 }
 
-func (c *Caller) CallTELNET(ctx telnet.Context, w telnet.Writer, r telnet.Reader) {
-	c.w = w
-	c.r = NewReader(r)
-
-	for _, cmd := range c.Cmds {
-		if err := cmd.Run(c); err != nil {
-			glog.Errorf("cmd: %v", err)
-			break
-		}
+func (c *Conn) Dial(hostport string) error {
+	conn, err := telnet.DialTo(hostport)
+	if err != nil {
+		return err
 	}
+	c.w = conn
+	c.r = NewReader(conn)
+	return c.Login()
 }
 
-func (c *Caller) writeLine(s string, star ...byte) error {
+func (c *Conn) writeLine(s string, star ...byte) error {
 	p := []byte(s + "\r\n")
 	_, err := c.w.Write(p)
 	if err != nil {
@@ -57,36 +56,38 @@ func (c *Caller) writeLine(s string, star ...byte) error {
 	return c.r.ExpectBytes(p)
 }
 
-func (c *Caller) WriteLine(s string) error {
+func (c *Conn) WriteLine(s string) error {
 	return c.writeLine(s)
 }
 
-func (c *Caller) WritePass(s string) error {
-	return c.writeLine(s, '*')
+func (c *Conn) WritePass() error {
+	return c.writeLine(c.Pass, '*')
 }
 
-func (c *Caller) SeekPrompt() error {
+func (c *Conn) SeekPrompt() error {
 	return c.r.SeekPast(c.Prompt)
 }
 
-func (c *Caller) Expect(s string) error {
+func (c *Conn) Expect(s string) error {
 	return c.r.ExpectBytes([]byte(s))
 }
 
-type Command interface {
-	Run(c *Caller) error
-}
-
-type LoginCmd struct {
-	Pass string
-}
-
-func (lc *LoginCmd) Run(c *Caller) error {
+func (c *Conn) Login() error {
 	if err := c.Expect("\r\nPassword: "); err != nil {
 		return fmt.Errorf("expect password: %v", err)
 	}
-	if err := c.WritePass(lc.Pass); err != nil {
+	if err := c.WritePass(); err != nil {
 		return fmt.Errorf("write password: %v", err)
+	}
+	// A second password prompt indicates login failure.
+	// Expect will rewind the input if it doesn't read these bytes.
+	// If the prompt is set to a string beginning with a capital P
+	// this will not work, but it's an easy, lazy check.
+	// Attempting to read a whole password prompt will cause the
+	// reader to block forever if the modem's command prompt is
+	// shorter, which it is by default.
+	if err := c.Expect("\r\nP"); err == nil {
+		return fmt.Errorf("invalid password")
 	}
 	if err := c.SeekPrompt(); err != nil {
 		return fmt.Errorf("expect prompt: %v", err)
@@ -95,62 +96,41 @@ func (lc *LoginCmd) Run(c *Caller) error {
 	return nil
 }
 
-type DiagCmd struct {
-	Out io.WriteCloser
+func (c *Conn) Exit() {
+	c.shutdown = true
+	c.WriteLine("exit")
+	c.w.Close()
 }
 
-func (dc *DiagCmd) Run(c *Caller) error {
+func (c *Conn) DumpDiags(diagFile string) error {
+	w, err := os.OpenFile(diagFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		glog.Exitf("Couldn't open diag file: %v", err)
+	}
+	defer w.Close()
 	if err := c.WriteLine("wan adsl diag"); err != nil {
 		return err
 	}
-
 	out, err := c.r.ReadPast("504~511\r\r\n")
 	if err != nil {
 		return err
 	}
-	if _, err = dc.Out.Write(out); err != nil {
+	if _, err = w.Write(out); err != nil {
 		return err
 	}
 	if err = c.WriteLine(""); err != nil {
 		return err
 	}
-	return c.SeekPrompt()
-}
-
-type NoiseMarginCmd struct{}
-
-func (nmc *NoiseMarginCmd) Run(c *Caller) error {
-	stats := make(map[string]float64)
-	recordStat := func(k string) error {
-		f, err := c.r.Float64()
-		stats[k] = f
+	if err = c.WriteLine("sys diag"); err != nil {
 		return err
 	}
-
-	convo := []struct {
-		f func(string) error
-		c string
-	}{
-		{c.WriteLine, "wan adsl l n"},
-		{c.r.SeekPast, "noise margin downstream: "},
-		{recordStat, "downmargin"},
-		{c.r.SeekPast, "attenuation downstream: "},
-		{recordStat, "downatten"},
-		{c.r.SeekPast, c.Prompt},
-		{c.WriteLine, "wan adsl l f"},
-		{c.r.SeekPast, "noise margin upstream: "},
-		{recordStat, "upmargin"},
-		{c.r.SeekPast, "attenuation upstream: "},
-		{recordStat, "upatten"},
-		{c.r.SeekPast, c.Prompt},
+	out, err = c.r.ReadTo(c.Prompt)
+	if err != nil {
+		return err
 	}
-
-	for _, s := range convo {
-		if err := s.f(s.c); err != nil {
-			return err
-		}
+	if _, err = w.Write(out); err != nil {
+		return err
 	}
-	glog.Infof("%v", stats)
 	return nil
 }
 
@@ -160,25 +140,37 @@ func main() {
 		glog.Exit("--modem_ip and --modem_pass are both required.")
 	}
 
-	caller := &Caller{
+	conn := &Conn{
 		Prompt: fmt.Sprintf("\r\n%s> ", *modemName),
-		Cmds: []Command{
-			&LoginCmd{Pass: *modemPass},
-			&NoiseMarginCmd{},
-		},
+		Pass:   *modemPass,
+	}
+
+	if err := conn.Dial(fmt.Sprintf("%s:%d", *modemIP, *modemPort)); err != nil {
+		glog.Exitf("Connection failed: %v", err)
 	}
 
 	if *diagFile != "" {
-		fh, err := os.OpenFile(*diagFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		err := conn.DumpDiags(*diagFile)
+		conn.Exit()
 		if err != nil {
-			glog.Exitf("Couldn't open diag file: %v", err)
+			glog.Exitf("Dumping diagnostics failed: %v", err)
 		}
-		defer fh.Close()
-		caller.Cmds = append(caller.Cmds, &DiagCmd{Out: fh})
+		glog.Exitf("Dumped diagnostics to %q", *diagFile)
 	}
 
-	hp := fmt.Sprintf("%s:%d", *modemIP, *modemPort)
-	if err := telnet.DialToAndCall(hp, caller); err != nil {
-		glog.Exitf("Connection failed: %v", err)
-	}
+	agg := &Aggregator{}
+	agg.Add(NoiseMargin(conn))
+	prometheus.MustRegister(agg)
+
+	server := &http.Server{Addr: fmt.Sprintf(":%d", *port)}
+	http.Handle("/metrics", promhttp.Handler())
+	http.HandleFunc("/quitquitquit", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "Shut down!")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		conn.Exit()
+		server.Shutdown(context.Background())
+	})
+	glog.Exitf(server.ListenAndServe().Error())
 }
