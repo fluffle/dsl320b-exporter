@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 
 	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
@@ -24,10 +27,13 @@ var (
 
 type Conn struct {
 	Prompt, Pass string
+	Server       *http.Server
 
 	w        *telnet.Conn
 	r        *Reader
+	mu       sync.Mutex
 	shutdown bool
+	sigch    chan os.Signal
 }
 
 func (c *Conn) Dial(hostport string) error {
@@ -96,10 +102,32 @@ func (c *Conn) Login() error {
 	return nil
 }
 
+func (c *Conn) SigHandler() {
+	c.sigch = make(chan os.Signal, 1)
+	signal.Notify(c.sigch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	for {
+		_, ok := <-c.sigch
+		if !ok {
+			break
+		}
+		c.Exit()
+	}
+}
+
 func (c *Conn) Exit() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.shutdown {
+		return
+	}
 	c.shutdown = true
-	c.WriteLine("exit")
+	signal.Stop(c.sigch)
+	close(c.sigch)
+	if err := c.WriteLine("exit"); err != nil {
+		glog.Errorf("exit: %v", err)
+	}
 	c.w.Close()
+	c.Server.Shutdown(context.Background())
 }
 
 func (c *Conn) DumpDiags(diagFile string) error {
@@ -116,9 +144,6 @@ func (c *Conn) DumpDiags(diagFile string) error {
 		return err
 	}
 	if _, err = w.Write(out); err != nil {
-		return err
-	}
-	if err = c.WriteLine(""); err != nil {
 		return err
 	}
 	if err = c.WriteLine("sys diag"); err != nil {
@@ -143,6 +168,7 @@ func main() {
 	conn := &Conn{
 		Prompt: fmt.Sprintf("\r\n%s> ", *modemName),
 		Pass:   *modemPass,
+		Server: &http.Server{Addr: fmt.Sprintf(":%d", *port)},
 	}
 
 	if err := conn.Dial(fmt.Sprintf("%s:%d", *modemIP, *modemPort)); err != nil {
@@ -160,17 +186,17 @@ func main() {
 
 	agg := &Aggregator{}
 	agg.Add(NoiseMargin(conn))
+	agg.Add(SyncRate(conn))
 	prometheus.MustRegister(agg)
 
-	server := &http.Server{Addr: fmt.Sprintf(":%d", *port)}
 	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/quitquitquit", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "Shut down!")
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-		conn.Exit()
-		server.Shutdown(context.Background())
+		go conn.Exit()
 	})
-	glog.Exitf(server.ListenAndServe().Error())
+	go conn.SigHandler()
+	glog.Exitf(conn.Server.ListenAndServe().Error())
 }

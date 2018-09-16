@@ -120,3 +120,78 @@ func (nm *noiseMargin) Collect(ch chan<- prometheus.Metric) {
 			"upstream")
 	}
 }
+
+type syncRate struct {
+	conn *Conn
+
+	// This collector collects sync rate stats
+	sync *prometheus.Desc
+}
+
+func SyncRate(conn *Conn) *syncRate {
+	return &syncRate{
+		conn: conn,
+		sync: makeDesc("line_sync_rate_kbps", "Line sync rate, in kbps", "direction", "channel_type"),
+	}
+}
+
+func (sr *syncRate) Describe(ch chan<- *prometheus.Desc) {
+	ch <- sr.sync
+}
+
+func (sr *syncRate) Collect(ch chan<- prometheus.Metric) {
+	stats := make(map[string]float64)
+	recordStat := func(k string) error {
+		i, err := sr.conn.r.Int64()
+		stats[k] = float64(i)
+		return err
+	}
+
+	convo := []struct {
+		f func(string) error
+		c string
+	}{
+		{sr.conn.WriteLine, "wan adsl c"},
+		{sr.conn.r.SeekPast, "near-end interleaved channel bit rate: "},
+		{recordStat, "downIntRate"},
+		{sr.conn.r.SeekPast, "near-end fast channel bit rate: "},
+		{recordStat, "downFastRate"},
+		{sr.conn.r.SeekPast, "far-end interleaved channel bit rate: "},
+		{recordStat, "upIntRate"},
+		{sr.conn.r.SeekPast, "far-end fast channel bit rate: "},
+		{recordStat, "upFastRate"},
+		{sr.conn.r.SeekPast, sr.conn.Prompt},
+	}
+
+	failed := false
+	for _, s := range convo {
+		if err := s.f(s.c); err != nil {
+			glog.Errorf("sync rate: c=%q err=%v", s.c, err)
+			failed = true
+			break
+		}
+	}
+	glog.Infoln("sync rate:", stats)
+	if !failed {
+		ch <- prometheus.MustNewConstMetric(
+			sr.sync,
+			prometheus.GaugeValue,
+			stats["downIntRate"],
+			"downstream", "interleaved")
+		ch <- prometheus.MustNewConstMetric(
+			sr.sync,
+			prometheus.GaugeValue,
+			stats["downFastRate"],
+			"downstream", "fast")
+		ch <- prometheus.MustNewConstMetric(
+			sr.sync,
+			prometheus.GaugeValue,
+			stats["upIntRate"],
+			"upstream", "interleaved")
+		ch <- prometheus.MustNewConstMetric(
+			sr.sync,
+			prometheus.GaugeValue,
+			stats["upFastRate"],
+			"upstream", "fast")
+	}
+}
