@@ -15,10 +15,8 @@ type Aggregator struct {
 	mu sync.Mutex
 }
 
-func (agg *Aggregator) Add(coll prometheus.Collector) {
-	agg.mu.Lock()
-	defer agg.mu.Unlock()
-	agg.c = append(agg.c, coll)
+func NewAggregator(coll ...prometheus.Collector) *Aggregator {
+	return &Aggregator{c: coll}
 }
 
 func (agg *Aggregator) Describe(ch chan<- *prometheus.Desc) {
@@ -37,161 +35,110 @@ func (agg *Aggregator) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-func makeDesc(stem, help string, labels ...string) *prometheus.Desc {
+// For my personal sanity.
+const (
+	Counter prometheus.ValueType = prometheus.CounterValue
+	Gauge   prometheus.ValueType = prometheus.GaugeValue
+)
+
+func NewDesc(stem, help string, labels ...string) *prometheus.Desc {
 	return prometheus.NewDesc("dsl320b_"+stem, help, labels, nil)
 }
 
-type noiseMargin struct {
+type Command struct {
 	conn *Conn
-
-	// This collector collects noise margin and line attenuation stats.
-	margin, atten *prometheus.Desc
+	Cmd  string
+	Ext  []Extractor
 }
 
-func NoiseMargin(conn *Conn) *noiseMargin {
-	return &noiseMargin{
-		conn:   conn,
-		margin: makeDesc("noise_margin_db", "SNR margin, in dB", "direction"),
-		atten:  makeDesc("line_attenuation_db", "Line attenuation, in dB", "direction"),
+type Extractor struct {
+	Identifier string
+	Desc       *prometheus.Desc
+	Type       prometheus.ValueType
+	Labels     []string
+}
+
+// Purely for variadic syntax construction.
+func NewExtractor(id string, desc *prometheus.Desc, typ prometheus.ValueType, labels ...string) Extractor {
+	return Extractor{
+		Identifier: id,
+		Desc:       desc,
+		Type:       typ,
+		Labels:     labels,
 	}
 }
 
-func (nm *noiseMargin) Describe(ch chan<- *prometheus.Desc) {
-	for _, d := range []*prometheus.Desc{nm.margin, nm.atten} {
-		ch <- d
-	}
-}
-
-func (nm *noiseMargin) Collect(ch chan<- prometheus.Metric) {
-	stats := make(map[string]float64)
-	recordStat := func(k string) error {
-		f, err := nm.conn.r.Float64()
-		stats[k] = f
-		return err
-	}
-
-	convo := []struct {
-		f func(string) error
-		c string
-	}{
-		{nm.conn.WriteLine, "wan adsl l n"},
-		{nm.conn.r.SeekPast, "noise margin downstream: "},
-		{recordStat, "downMargin"},
-		{nm.conn.r.SeekPast, "attenuation downstream: "},
-		{recordStat, "downAtten"},
-		{nm.conn.r.SeekPast, nm.conn.Prompt},
-		{nm.conn.WriteLine, "wan adsl l f"},
-		{nm.conn.r.SeekPast, "noise margin upstream: "},
-		{recordStat, "upMargin"},
-		{nm.conn.r.SeekPast, "attenuation upstream: "},
-		{recordStat, "upAtten"},
-		{nm.conn.r.SeekPast, nm.conn.Prompt},
-	}
-
-	failed := false
-	for _, s := range convo {
-		if err := s.f(s.c); err != nil {
-			glog.Errorf("noise margin: c=%q err=%v", s.c, err)
-			failed = true
-			break
+func (c *Command) Describe(ch chan<- *prometheus.Desc) {
+	seen := make(map[*prometheus.Desc]bool)
+	for _, ext := range c.Ext {
+		if !seen[ext.Desc] {
+			seen[ext.Desc] = true
+			ch <- ext.Desc
 		}
 	}
-	glog.Infoln("noise margin:", stats)
-	if !failed {
-		ch <- prometheus.MustNewConstMetric(
-			nm.margin,
-			prometheus.GaugeValue,
-			stats["downMargin"],
-			"downstream")
-		ch <- prometheus.MustNewConstMetric(
-			nm.margin,
-			prometheus.GaugeValue,
-			stats["upMargin"],
-			"upstream")
-		ch <- prometheus.MustNewConstMetric(
-			nm.atten,
-			prometheus.GaugeValue,
-			stats["downAtten"],
-			"downstream")
-		ch <- prometheus.MustNewConstMetric(
-			nm.atten,
-			prometheus.GaugeValue,
-			stats["upAtten"],
-			"upstream")
+}
+
+func (c *Command) Collect(ch chan<- prometheus.Metric) {
+	if err := c.conn.WriteLine(c.Cmd); err != nil {
+		glog.Errorf("collect: write command %q failed: %v", c.Cmd, err)
+		return
+	}
+	for _, ext := range c.Ext {
+		metric, err := c.conn.ExtractNumber(ext)
+		if err != nil {
+			glog.Errorf("collect: extract number after %q failed: %v", ext.Identifier, err)
+			continue
+		}
+		ch <- metric
+	}
+	if err := c.conn.SeekPrompt(); err != nil {
+		glog.Errorf("collect: seek prompt failed: %v", err)
 	}
 }
 
-type syncRate struct {
-	conn *Conn
-
-	// This collector collects sync rate stats
-	sync *prometheus.Desc
-}
-
-func SyncRate(conn *Conn) *syncRate {
-	return &syncRate{
+// The NoiseMargin collector collects upstream noise margin and line attenuation stats.
+func NoiseMargin(conn *Conn, dir string) *Command {
+	cmd := "wan adsl l n"
+	if dir == "upstream" {
+		cmd = "wan adsl l f"
+	}
+	marginDesc := NewDesc("noise_margin_db", "SNR margin, in dB", "direction")
+	attenDesc := NewDesc("line_attenuation_db", "Line attenuation, in dB", "direction")
+	return &Command{
 		conn: conn,
-		sync: makeDesc("line_sync_rate_kbps", "Line sync rate, in kbps", "direction", "channel_type"),
+		Cmd:  cmd,
+		Ext: []Extractor{
+			NewExtractor("noise margin "+dir+": ", marginDesc, Gauge, dir),
+			NewExtractor("attenuation "+dir+": ", attenDesc, Gauge, dir),
+		},
 	}
 }
 
-func (sr *syncRate) Describe(ch chan<- *prometheus.Desc) {
-	ch <- sr.sync
+func SyncRate(conn *Conn) *Command {
+	syncDesc := NewDesc("line_sync_rate_kbps", "Line sync rate, in kbps", "direction", "channel_type")
+	return &Command{
+		conn: conn,
+		Cmd:  "wan adsl c",
+		Ext: []Extractor{
+			NewExtractor("near-end interleaved channel bit rate: ",
+				syncDesc, Gauge, "downstream", "interleaved"),
+			NewExtractor("near-end fast channel bit rate: ",
+				syncDesc, Gauge, "downstream", "fast"),
+			NewExtractor("far-end interleaved channel bit rate: ",
+				syncDesc, Gauge, "upstream", "interleaved"),
+			NewExtractor("far-end fast channel bit rate: ",
+				syncDesc, Gauge, "upstream", "fast"),
+		},
+	}
 }
 
-func (sr *syncRate) Collect(ch chan<- prometheus.Metric) {
-	stats := make(map[string]float64)
-	recordStat := func(k string) error {
-		i, err := sr.conn.r.Int64()
-		stats[k] = float64(i)
-		return err
-	}
-
-	convo := []struct {
-		f func(string) error
-		c string
-	}{
-		{sr.conn.WriteLine, "wan adsl c"},
-		{sr.conn.r.SeekPast, "near-end interleaved channel bit rate: "},
-		{recordStat, "downIntRate"},
-		{sr.conn.r.SeekPast, "near-end fast channel bit rate: "},
-		{recordStat, "downFastRate"},
-		{sr.conn.r.SeekPast, "far-end interleaved channel bit rate: "},
-		{recordStat, "upIntRate"},
-		{sr.conn.r.SeekPast, "far-end fast channel bit rate: "},
-		{recordStat, "upFastRate"},
-		{sr.conn.r.SeekPast, sr.conn.Prompt},
-	}
-
-	failed := false
-	for _, s := range convo {
-		if err := s.f(s.c); err != nil {
-			glog.Errorf("sync rate: c=%q err=%v", s.c, err)
-			failed = true
-			break
-		}
-	}
-	glog.Infoln("sync rate:", stats)
-	if !failed {
-		ch <- prometheus.MustNewConstMetric(
-			sr.sync,
-			prometheus.GaugeValue,
-			stats["downIntRate"],
-			"downstream", "interleaved")
-		ch <- prometheus.MustNewConstMetric(
-			sr.sync,
-			prometheus.GaugeValue,
-			stats["downFastRate"],
-			"downstream", "fast")
-		ch <- prometheus.MustNewConstMetric(
-			sr.sync,
-			prometheus.GaugeValue,
-			stats["upIntRate"],
-			"upstream", "interleaved")
-		ch <- prometheus.MustNewConstMetric(
-			sr.sync,
-			prometheus.GaugeValue,
-			stats["upFastRate"],
-			"upstream", "fast")
+func SysUptime(conn *Conn) *Command {
+	uptimeDesc := NewDesc("system_uptime_ticks", "System uptime, in ticks (1/100 secs)")
+	return &Command{
+		conn: conn,
+		Cmd:  "sys version",
+		Ext: []Extractor{
+			NewExtractor("system up time: ", uptimeDesc, Gauge),
+		},
 	}
 }

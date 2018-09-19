@@ -102,6 +102,29 @@ func (c *Conn) Login() error {
 	return nil
 }
 
+func (c *Conn) ExtractNumber(e Extractor, labels ...string) (prometheus.Metric, error) {
+	return c.extractFunc(c.r.Float64, e, labels...)
+}
+
+func (c *Conn) ExtractHex(e Extractor, labels ...string) (prometheus.Metric, error) {
+	f := func() (float64, error) {
+		i, err := c.r.Hex64()
+		return float64(i), err
+	}
+	return c.extractFunc(f, e, labels...)
+}
+
+func (c *Conn) extractFunc(f func() (float64, error), e Extractor, labels ...string) (prometheus.Metric, error) {
+	if err := c.r.SeekPast(e.Identifier); err != nil {
+		return nil, err
+	}
+	n, err := f()
+	if err != nil {
+		return nil, err
+	}
+	return prometheus.NewConstMetric(e.Desc, e.Type, n, e.Labels...)
+}
+
 func (c *Conn) SigHandler() {
 	c.sigch = make(chan os.Signal, 1)
 	signal.Notify(c.sigch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
@@ -184,9 +207,12 @@ func main() {
 		glog.Exitf("Dumped diagnostics to %q", *diagFile)
 	}
 
-	agg := &Aggregator{}
-	agg.Add(NoiseMargin(conn))
-	agg.Add(SyncRate(conn))
+	agg := NewAggregator(
+		SysUptime(conn),
+		NoiseMargin(conn, "upstream"),
+		NoiseMargin(conn, "downstream"),
+		SyncRate(conn),
+	)
 	prometheus.MustRegister(agg)
 
 	http.Handle("/metrics", promhttp.Handler())
