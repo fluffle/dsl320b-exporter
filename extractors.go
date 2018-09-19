@@ -29,6 +29,22 @@ func (fa FloatAfter) String() string {
 	return fmt.Sprintf("float after %q", string(fa))
 }
 
+// The HexAfter extractor scans the response for the string and
+// extracts the hexadecimal integer directly after it.
+type HexAfter string
+
+func (ha HexAfter) Extract(r *Reader) (float64, []string, error) {
+	if err := r.SeekPast(string(ha)); err != nil {
+		return 0, nil, err
+	}
+	f, err := r.Hex64()
+	return float64(f), nil, err
+}
+
+func (ha HexAfter) String() string {
+	return fmt.Sprintf("hex int after %q", string(ha))
+}
+
 // The StringAfter extractor scans the response for the string and
 // extracts the remainder of the line to a label.
 type StringAfter string

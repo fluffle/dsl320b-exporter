@@ -45,9 +45,9 @@ func (agg *Aggregator) Collect(ch chan<- prometheus.Metric) {
 // downstream stats, this constructor has an additional "up" parameter.
 // If this is true, we collect upstream stats, if false, downstream.
 func NoiseMargin(conn *Conn, up bool) *Command {
-	cmd, dir := "wan adsl l n", "downstream"
+	cmd, dir := "wan adsl linedata near", "downstream"
 	if up {
-		cmd, dir = "wan adsl l f", "upstream"
+		cmd, dir = "wan adsl linedata far", "upstream"
 	}
 	marginDesc := NewDesc("noise_margin_db", "SNR margin, in dB", "direction")
 	attenDesc := NewDesc("line_attenuation_db", "Line attenuation, in dB", "direction")
@@ -66,7 +66,7 @@ func SyncRate(conn *Conn) *Command {
 	syncDesc := NewDesc("line_sync_rate_kbps", "Line sync rate, in kbps", "direction", "channel_type")
 	return &Command{
 		conn: conn,
-		Cmd:  "wan adsl c",
+		Cmd:  "wan adsl chandata",
 		Metrics: []Metric{
 			NewMetric(FloatAfter("near-end interleaved channel bit rate: "),
 				syncDesc, Gauge, "downstream", "interleaved"),
@@ -115,13 +115,13 @@ func ADSLMode(conn *Conn) *Command {
 }
 
 func ADSLErrors(conn *Conn) *Command {
-	errorDesc := NewDesc("adsl_error_count", "ADSL HEC/FEC/CRC error counts", "direction", "channel_type", "error_type")
+	errorDesc := NewDesc("adsl_framing_error_count", "ADSL HEC/FEC/CRC error counts", "direction", "channel_type", "error_type")
 	errSecDesc := NewDesc("adsl_error_seconds_count", "ADSL error-seconds")
 	adslUpDesc := NewDesc("adsl_uptime_seconds", "How long the ADSL connection has been up, in seconds")
 
 	return &Command{
 		conn: conn,
-		Cmd:  "wan adsl p",
+		Cmd:  "wan adsl perfdata",
 		Metrics: []Metric{
 			// TODO(fluffle): There must be a nicer way to extract these.
 			NewMetric(FloatAfter("near-end FEC error fast: "),
@@ -151,6 +151,62 @@ func ADSLErrors(conn *Conn) *Command {
 			NewMetric(FloatAfter("Error second after power-up\t: "),
 				errSecDesc, Counter),
 			NewMetric(ADSLUptime{}, adslUpDesc, Gauge),
+		},
+	}
+}
+
+func ATMCells(conn *Conn) *Command {
+	cellsDesc := NewDesc("atm_cell_count", "The number of ATM cells received or transmitted", "direction", "channel_type")
+
+	return &Command{
+		conn: conn,
+		Cmd:  "wan adsl cellcnt",
+		Metrics: []Metric{
+			NewMetric(FloatAfter("ActiveRxCellsFast        = "),
+				cellsDesc, Counter, "downstream", "fast"),
+			NewMetric(FloatAfter("ActiveRxCellsInterleaved = "),
+				cellsDesc, Counter, "downstream", "interleaved"),
+			NewMetric(FloatAfter("ActiveTxCellsFast        = "),
+				cellsDesc, Counter, "upstream", "fast"),
+			NewMetric(FloatAfter("ActiveTxCellsInterleaved = "),
+				cellsDesc, Counter, "upstream", "interleaved"),
+		},
+	}
+}
+
+func SARCounters(conn *Conn) *Command {
+	packetsDesc := NewDesc("adsl_packet_count", "The number of packets received or transmitted over the ADSL interface", "direction")
+	discardsDesc := NewDesc("adsl_packet_discard_count", "The number of packets discarded by the ADSL interface", "direction")
+	errsDesc := NewDesc("adsl_packet_error_count", "The number of packet errors observed by the ADSL interface", "direction", "error_type")
+	resetsDesc := NewDesc("adsl_soft_reset_count", "The number of soft resets")
+	mpoaErrsDesc := NewDesc("adsl_mpoa_error_count", "The number of MPoA errors")
+
+	return &Command{
+		conn: conn,
+		Cmd:  "wan hwsar disp",
+		Metrics: []Metric{
+			NewMetric(HexAfter("inPkts         = "),
+				packetsDesc, Counter, "downstream"),
+			NewMetric(HexAfter("inDiscards     = "),
+				discardsDesc, Counter, "downstream"),
+			NewMetric(HexAfter("inBufErr       = "),
+				errsDesc, Counter, "downstream", "buffer"),
+			NewMetric(HexAfter("inCrcErr       = "),
+				errsDesc, Counter, "downstream", "CRC"),
+			NewMetric(HexAfter("inBufOverflow  = "),
+				errsDesc, Counter, "downstream", "buffer_overflow"),
+			NewMetric(HexAfter("inBufMaxLenErr = "),
+				errsDesc, Counter, "downstream", "buffer_max_len"),
+			NewMetric(HexAfter("inBufLenErr    = "),
+				errsDesc, Counter, "downstream", "buffer_len"),
+			NewMetric(HexAfter("outPkts        = "),
+				packetsDesc, Counter, "upstream"),
+			NewMetric(HexAfter("outDiscards    = "),
+				discardsDesc, Counter, "upstream"),
+			NewMetric(HexAfter("softRstCnt     = "),
+				resetsDesc, Counter),
+			NewMetric(HexAfter("inMpoaErr      = "),
+				mpoaErrsDesc, Counter),
 		},
 	}
 }

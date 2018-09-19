@@ -192,6 +192,8 @@ func main() {
 		NoiseMargin(conn, false),
 		NoiseMargin(conn, true),
 		SyncRate(conn),
+		ATMCells(conn),
+		SARCounters(conn),
 	)
 	prometheus.MustRegister(agg)
 

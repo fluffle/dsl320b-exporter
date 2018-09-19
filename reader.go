@@ -500,6 +500,11 @@ func (r *Reader) parseInt(base int, bitSize int) (int64, error) {
 		if _, err := r.expectBytes([]byte("0x")); err != nil {
 			return rewind(err)
 		}
+		// We specify the base explicitly, which means strconv chokes
+		// on a leading 0x. Maybe we should defer more of the checks
+		// to strconv rather than hacking around it.
+		r.PopMark()
+		r.PushMark()
 	default:
 		return 0, fmt.Errorf("invalid base: %d", base)
 	}
