@@ -2,11 +2,16 @@ package main
 
 import "fmt"
 
+// An extractor is responsible for scanning telnet command responses and
+// extracting floats from them. Extractors should not consume from the
+// reader once they have extracted the float.
 type Extractor interface {
 	fmt.Stringer
 	Extract(*Reader) (float64, error)
 }
 
+// The FloatAfter extractor scans the response for the string and
+// extracts the number directly after it.
 type FloatAfter string
 
 func (fa FloatAfter) Extract(r *Reader) (float64, error) {
@@ -20,7 +25,8 @@ func (fa FloatAfter) String() string {
 	return fmt.Sprintf("float after %q", string(fa))
 }
 
-// Specialist extractor for system uptime.
+// The SystemUptime extractor is a specialist extractor that converts
+// the uptime ticks (expressed as a hexadecimal unsigned int) to seconds.
 type SystemUptime struct{}
 
 func (_ SystemUptime) Extract(r *Reader) (float64, error) {

@@ -186,8 +186,8 @@ func main() {
 
 	agg := NewAggregator(
 		SysUptime(conn),
-		NoiseMargin(conn, "upstream"),
-		NoiseMargin(conn, "downstream"),
+		NoiseMargin(conn, false),
+		NoiseMargin(conn, true),
 		SyncRate(conn),
 	)
 	prometheus.MustRegister(agg)

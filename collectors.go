@@ -1,10 +1,53 @@
 package main
 
-// The NoiseMargin collector collects upstream noise margin and line attenuation stats.
-func NoiseMargin(conn *Conn, dir string) *Command {
-	cmd := "wan adsl l n"
-	if dir == "upstream" {
-		cmd = "wan adsl l f"
+import (
+	"sync"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+// For my personal sanity.
+const (
+	Counter prometheus.ValueType = prometheus.CounterValue
+	Gauge   prometheus.ValueType = prometheus.GaugeValue
+)
+
+// The Prometheus client library performs collection concurrently.
+// This won't play well with our telnet interface, so we register
+// a single Aggregator collector which serializes collection.
+type Aggregator struct {
+	c  []prometheus.Collector
+	mu sync.Mutex
+}
+
+func NewAggregator(coll ...prometheus.Collector) *Aggregator {
+	return &Aggregator{c: coll}
+}
+
+func (agg *Aggregator) Describe(ch chan<- *prometheus.Desc) {
+	agg.mu.Lock()
+	defer agg.mu.Unlock()
+	for _, coll := range agg.c {
+		coll.Describe(ch)
+	}
+}
+
+func (agg *Aggregator) Collect(ch chan<- prometheus.Metric) {
+	agg.mu.Lock()
+	defer agg.mu.Unlock()
+	for _, coll := range agg.c {
+		coll.Collect(ch)
+	}
+}
+
+// The NoiseMargin collector collects noise margin and line attenuation stats.
+// Because we need to run different commands to collect upstream and
+// downstream stats, this constructor has an additional "up" parameter.
+// If this is true, we collect upstream stats, if false, downstream.
+func NoiseMargin(conn *Conn, up bool) *Command {
+	cmd, dir := "wan adsl l n", "downstream"
+	if up {
+		cmd, dir = "wan adsl l f", "upstream"
 	}
 	marginDesc := NewDesc("noise_margin_db", "SNR margin, in dB", "direction")
 	attenDesc := NewDesc("line_attenuation_db", "Line attenuation, in dB", "direction")
@@ -18,6 +61,7 @@ func NoiseMargin(conn *Conn, dir string) *Command {
 	}
 }
 
+// The SyncRate collector collects line sync rate stats.
 func SyncRate(conn *Conn) *Command {
 	syncDesc := NewDesc("line_sync_rate_kbps", "Line sync rate, in kbps", "direction", "channel_type")
 	return &Command{
@@ -36,6 +80,7 @@ func SyncRate(conn *Conn) *Command {
 	}
 }
 
+// The SysUptime collector collects the current system uptime.
 func SysUptime(conn *Conn) *Command {
 	uptimeDesc := NewDesc("system_uptime_seconds", "System uptime, in seconds")
 	return &Command{

@@ -1,56 +1,18 @@
 package main
 
 import (
-	"sync"
-
 	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// The Prometheus client library performs collection concurrently.
-// This won't play well with our telnet interface, so we register
-// a single Aggregator collector which serializes collection.
-type Aggregator struct {
-	c  []prometheus.Collector
-	mu sync.Mutex
-}
-
-func NewAggregator(coll ...prometheus.Collector) *Aggregator {
-	return &Aggregator{c: coll}
-}
-
-func (agg *Aggregator) Describe(ch chan<- *prometheus.Desc) {
-	agg.mu.Lock()
-	defer agg.mu.Unlock()
-	for _, coll := range agg.c {
-		coll.Describe(ch)
-	}
-}
-
-func (agg *Aggregator) Collect(ch chan<- prometheus.Metric) {
-	agg.mu.Lock()
-	defer agg.mu.Unlock()
-	for _, coll := range agg.c {
-		coll.Collect(ch)
-	}
-}
-
-// For my personal sanity.
-const (
-	Counter prometheus.ValueType = prometheus.CounterValue
-	Gauge   prometheus.ValueType = prometheus.GaugeValue
-)
-
+// NewDesc is a helper function to create a prometheus metric descriptor.
+// It enforces that all metrics begin with the exporter name "dsl320b".
 func NewDesc(stem, help string, labels ...string) *prometheus.Desc {
 	return prometheus.NewDesc("dsl320b_"+stem, help, labels, nil)
 }
 
-type Command struct {
-	conn    *Conn
-	Cmd     string
-	Metrics []Metric
-}
-
+// A Metric ties an Extractor to the metadata required to turn the extracted
+// float into a prometheus Metric.
 type Metric struct {
 	Ext    Extractor
 	Desc   *prometheus.Desc
@@ -58,7 +20,7 @@ type Metric struct {
 	Labels []string
 }
 
-// Purely for variadic syntax construction.
+// NewMetric makes creating new Metrics nicer, thanks to variadic labels.
 func NewMetric(ext Extractor, desc *prometheus.Desc, typ prometheus.ValueType, labels ...string) Metric {
 	return Metric{
 		Ext:    ext,
@@ -68,6 +30,8 @@ func NewMetric(ext Extractor, desc *prometheus.Desc, typ prometheus.ValueType, l
 	}
 }
 
+// ReadMetric extracts a float from the Reader and combines it with Metric
+// metadata to create a prometheus Metric ready for collection.
 func (m Metric) ReadMetric(r *Reader) (prometheus.Metric, error) {
 	f, err := m.Ext.Extract(r)
 	if err != nil {
@@ -76,6 +40,16 @@ func (m Metric) ReadMetric(r *Reader) (prometheus.Metric, error) {
 	return prometheus.NewConstMetric(m.Desc, m.Type, f, m.Labels...)
 }
 
+// A Command executes a single command via the telnet connection, then collects
+// each of its Metrics in order. If the order of Metrics and their Extractors
+// doesn't match the output of the command, you're gonna have a bad time!
+type Command struct {
+	conn    *Conn
+	Cmd     string
+	Metrics []Metric
+}
+
+// Describe writes prometheus descriptors to the provided channel.
 func (c *Command) Describe(ch chan<- *prometheus.Desc) {
 	seen := make(map[*prometheus.Desc]bool)
 	for _, m := range c.Metrics {
@@ -86,6 +60,7 @@ func (c *Command) Describe(ch chan<- *prometheus.Desc) {
 	}
 }
 
+// Collect executes the command and reads metric values from the response.
 func (c *Command) Collect(ch chan<- prometheus.Metric) {
 	if err := c.conn.WriteLine(c.Cmd); err != nil {
 		glog.Errorf("collect: write command %q failed: %v", c.Cmd, err)
