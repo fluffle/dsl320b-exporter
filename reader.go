@@ -327,8 +327,10 @@ func (r *Reader) until(delim []byte, consume bool, skip bool) (read []byte, err 
 	return
 }
 
-func (r *Reader) scan(f byteScanner) ([]byte, error) {
-	r.PushMark()
+func (r *Reader) scan(f byteScanner, skip bool) ([]byte, error) {
+	if !skip {
+		r.PushMark()
+	}
 	b, err := r.Peek(1)
 	for err == nil {
 		if len(b) == 0 {
@@ -339,16 +341,27 @@ func (r *Reader) scan(f byteScanner) ([]byte, error) {
 			break
 		}
 		r.Advance(1)
+		if skip {
+			r.Done()
+		}
 		b, err = r.Peek(1)
+	}
+	if skip {
+		return nil, err
 	}
 	mark := r.PopMark()
 	return r.buf[mark:r.p], err
 }
 
 func (r *Reader) Scan(f byteScanner) ([]byte, error) {
-	b, err := r.scan(f)
+	b, err := r.scan(f, false)
 	r.Done()
 	return b, err
+}
+
+func (r *Reader) Skip(f byteScanner) error {
+	_, err := r.scan(f, true)
+	return err
 }
 
 type byteScanner func(byte) bool
@@ -361,6 +374,18 @@ func IsHexDigit(b byte) bool {
 	return IsDigit(b) ||
 		(b >= 'a' && b <= 'f') ||
 		(b >= 'A' && b <= 'F')
+}
+
+func Is(compare byte) byteScanner {
+	return func(b byte) bool {
+		return compare == b
+	}
+}
+
+func Not(compare byte) byteScanner {
+	return func(b byte) bool {
+		return compare != b
+	}
 }
 
 // Float64 consumes numbers matching the following regex:
@@ -389,7 +414,7 @@ func (r *Reader) Float64() (float64, error) {
 		return rewind(err)
 	}
 	scanNumbers := func() error {
-		b, err := r.scan(IsDigit)
+		b, err := r.scan(IsDigit, false)
 		if err == nil && len(b) == 0 {
 			// Expected >0 digits for valid float, so mimic strconv's error.
 			return strconv.ErrSyntax
@@ -480,7 +505,7 @@ func (r *Reader) parseInt(base int, bitSize int) (int64, error) {
 	}
 
 	// Numbers!
-	b, err := r.scan(scanFunc)
+	b, err := r.scan(scanFunc, false)
 	if err != nil && err != io.EOF {
 		return rewind(err)
 	}
