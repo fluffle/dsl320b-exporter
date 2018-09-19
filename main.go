@@ -186,6 +186,9 @@ func main() {
 
 	agg := NewAggregator(
 		SysUptime(conn),
+		ADSLStatus(conn),
+		ADSLMode(conn),
+		ADSLErrors(conn),
 		NoiseMargin(conn, false),
 		NoiseMargin(conn, true),
 		SyncRate(conn),

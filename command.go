@@ -33,11 +33,12 @@ func NewMetric(ext Extractor, desc *prometheus.Desc, typ prometheus.ValueType, l
 // ReadMetric extracts a float from the Reader and combines it with Metric
 // metadata to create a prometheus Metric ready for collection.
 func (m Metric) ReadMetric(r *Reader) (prometheus.Metric, error) {
-	f, err := m.Ext.Extract(r)
+	f, labels, err := m.Ext.Extract(r)
 	if err != nil {
 		return nil, err
 	}
-	return prometheus.NewConstMetric(m.Desc, m.Type, f, m.Labels...)
+	glog.V(2).Infof("extract %s = %g %v", m.Ext, f, labels)
+	return prometheus.NewConstMetric(m.Desc, m.Type, f, append(m.Labels, labels...)...)
 }
 
 // A Command executes a single command via the telnet connection, then collects

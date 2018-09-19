@@ -291,7 +291,7 @@ func (r *Reader) until(delim []byte, consume bool, skip bool) (read []byte, err 
 	}
 	for {
 		// Search the unsearched parts of the buffer.
-		glog.V(2).Infof("r=%d m=%v p=%d w=%d len=%d", r.r, r.m, r.p, r.w, len(r.buf))
+		// glog.V(2).Infof("r=%d m=%v p=%d w=%d len=%d", r.r, r.m, r.p, r.w, len(r.buf))
 		if i := bytes.Index(r.buf[r.p:r.w], delim); i >= 0 {
 			r.p += i
 			if consume {

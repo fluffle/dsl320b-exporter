@@ -91,3 +91,66 @@ func SysUptime(conn *Conn) *Command {
 		},
 	}
 }
+
+func ADSLStatus(conn *Conn) *Command {
+	statusDesc := NewDesc("adsl_modem_status", "Current ADSL modem status", "status")
+	return &Command{
+		conn: conn,
+		Cmd:  "wan adsl status",
+		Metrics: []Metric{
+			NewMetric(StringAfter("current modem status: "), statusDesc, Gauge),
+		},
+	}
+}
+
+func ADSLMode(conn *Conn) *Command {
+	modeDesc := NewDesc("adsl_modem_operating_mode", "Current ADSL modem operating mode", "mode")
+	return &Command{
+		conn: conn,
+		Cmd:  "wan adsl opmode",
+		Metrics: []Metric{
+			NewMetric(StringAfter("operational mode: "), modeDesc, Gauge),
+		},
+	}
+}
+
+func ADSLErrors(conn *Conn) *Command {
+	errorDesc := NewDesc("adsl_error_count", "ADSL HEC/FEC/CRC error counts", "direction", "channel_type", "error_type")
+	errSecDesc := NewDesc("adsl_error_seconds_count", "ADSL error-seconds")
+	adslUpDesc := NewDesc("adsl_uptime_seconds", "How long the ADSL connection has been up, in seconds")
+
+	return &Command{
+		conn: conn,
+		Cmd:  "wan adsl p",
+		Metrics: []Metric{
+			// TODO(fluffle): There must be a nicer way to extract these.
+			NewMetric(FloatAfter("near-end FEC error fast: "),
+				errorDesc, Counter, "downstream", "fast", "FEC"),
+			NewMetric(FloatAfter("near-end FEC error interleaved: "),
+				errorDesc, Counter, "downstream", "interleaved", "FEC"),
+			NewMetric(FloatAfter("near-end CRC error fast: "),
+				errorDesc, Counter, "downstream", "fast", "CRC"),
+			NewMetric(FloatAfter("near-end CRC error interleaved: "),
+				errorDesc, Counter, "downstream", "interleaved", "CRC"),
+			NewMetric(FloatAfter("near-end HEC error fast: "),
+				errorDesc, Counter, "downstream", "fast", "HEC"),
+			NewMetric(FloatAfter("near-end HEC error interleaved: "),
+				errorDesc, Counter, "downstream", "interleaved", "HEC"),
+			NewMetric(FloatAfter("far-end FEC error fast: "),
+				errorDesc, Counter, "upstream", "fast", "FEC"),
+			NewMetric(FloatAfter("far-end FEC error interleaved: "),
+				errorDesc, Counter, "upstream", "interleaved", "FEC"),
+			NewMetric(FloatAfter("far-end CRC error fast: "),
+				errorDesc, Counter, "upstream", "fast", "CRC"),
+			NewMetric(FloatAfter("far-end CRC error interleaved: "),
+				errorDesc, Counter, "upstream", "interleaved", "CRC"),
+			NewMetric(FloatAfter("far-end HEC error fast: "),
+				errorDesc, Counter, "upstream", "fast", "HEC"),
+			NewMetric(FloatAfter("far-end HEC error interleaved: "),
+				errorDesc, Counter, "upstream", "interleaved", "HEC"),
+			NewMetric(FloatAfter("Error second after power-up\t: "),
+				errSecDesc, Counter),
+			NewMetric(ADSLUptime{}, adslUpDesc, Gauge),
+		},
+	}
+}
