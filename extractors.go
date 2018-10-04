@@ -123,3 +123,62 @@ func (_ ADSLUptime) Extract(r *Reader) (float64, []string, error) {
 func (_ ADSLUptime) String() string {
 	return "adsl uptime"
 }
+
+type MBufSize string // "d" or "h" for data or header
+
+// Extract grabs the start and end pointers and returns the difference.
+func (ms MBufSize) Extract(r *Reader) (float64, []string, error) {
+	if err := r.SeekPast(string("m" + ms + "sp=")); err != nil {
+		return 0, nil, err
+	}
+	sp, err := r.Hex64()
+	if err != nil {
+		return 0, nil, err
+	}
+	if err := r.SeekPast(string("m" + ms + "ep=")); err != nil {
+		return 0, nil, err
+	}
+	ep, err := r.Hex64()
+	if err != nil {
+		return 0, nil, err
+	}
+	return float64(ep - sp), nil, nil
+}
+
+func (ms MBufSize) String() string {
+	if ms == "h" {
+		return "mbuf header size"
+	}
+	return "mbuf data size"
+}
+
+type CPUUsage struct{}
+
+func (_ CPUUsage) Extract(r *Reader) (float64, []string, error) {
+	if err := r.SeekPast("baseline "); err != nil {
+		return 0, nil, err
+	}
+	base, err := r.Float64()
+	if err != nil {
+		return 0, nil, err
+	}
+
+	sum := float64(0)
+
+	for i := 0; i < 63; i++ {
+		ident := fmt.Sprintf(" %2d ", i)
+		if err := r.SeekPast(ident); err != nil {
+			return 0, nil, err
+		}
+		idle, err := r.Float64()
+		if err != nil {
+			return 0, nil, err
+		}
+		sum += base - idle
+	}
+	return sum / (63 * base), nil, nil
+}
+
+func (_ CPUUsage) String() string {
+	return "CPU utilization"
+}

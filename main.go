@@ -149,7 +149,7 @@ func (c *Conn) DumpDiags(diagFile string) error {
 	if err = c.WriteLine("sys diag"); err != nil {
 		return err
 	}
-	out, err = c.r.ReadTo(c.Prompt)
+	out, err = c.r.ReadPast(c.Prompt)
 	if err != nil {
 		return err
 	}
@@ -174,6 +174,7 @@ func main() {
 	if err := conn.Dial(fmt.Sprintf("%s:%d", *modemIP, *modemPort)); err != nil {
 		glog.Exitf("Connection failed: %v", err)
 	}
+	go conn.SigHandler()
 
 	if *diagFile != "" {
 		err := conn.DumpDiags(*diagFile)
@@ -186,6 +187,9 @@ func main() {
 
 	agg := NewAggregator(
 		SysUptime(conn),
+		CPUStats(conn),
+		HeapStats(conn),
+		MBufStats(conn),
 		ADSLStatus(conn),
 		ADSLMode(conn),
 		ADSLErrors(conn),
@@ -194,6 +198,7 @@ func main() {
 		SyncRate(conn),
 		ATMCells(conn),
 		SARCounters(conn),
+		EthCounters(conn),
 	)
 	prometheus.MustRegister(agg)
 
@@ -205,6 +210,5 @@ func main() {
 		}
 		go conn.Exit()
 	})
-	go conn.SigHandler()
 	glog.Exitf(conn.Server.ListenAndServe().Error())
 }
