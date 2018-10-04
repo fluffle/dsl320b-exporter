@@ -21,7 +21,7 @@ var (
 	modemIP   = flag.String("modem_ip", "", "Internal IP of the modem.")
 	modemPort = flag.Int("modem_port", 23, "Port to telnet to.")
 	modemPass = flag.String("modem_pass", "", "Admin password for the modem.")
-	modemName = flag.String("modem_hostname", "modem", "Hostname for modem.")
+	modemName = flag.String("modem_hostname", "tc", "Hostname for modem.")
 	diagFile  = flag.String("diag_file", "", "Dump diag to this file.")
 )
 
