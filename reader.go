@@ -1,5 +1,12 @@
 package main
 
+// Parts of this file are modified from the Go standard library
+// packages "bufio" and "bytes", which are Copyright (c) The Go Authors
+// and redistributed under LICENSE.golang.
+//
+// I really didn't want to have to copy a whole pile of bufio into
+// this code, but ugh I appear to have exhausted other options.
+
 import (
 	"bytes"
 	"errors"
@@ -9,9 +16,6 @@ import (
 
 	"github.com/golang/glog"
 )
-
-// I really didn't want to have to copy a whole pile of bufio into
-// this code, but ugh I appear to have exhausted other options.
 
 type Reader struct {
 	buf []byte
