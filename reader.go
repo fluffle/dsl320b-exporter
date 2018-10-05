@@ -501,14 +501,14 @@ func (r *Reader) parseInt(base int, bitSize int) (int64, error) {
 	case 16:
 		scanFunc = IsHexDigit
 		// Leading 0x
-		if _, err := r.expectBytes([]byte("0x")); err != nil {
+		if found, err := r.expectBytes([]byte("0x")); err != nil {
 			return rewind(err)
+		} else if found {
+			// If we specify the base explicitly, strconv chokes
+			// on a leading 0x. So, if there is one, set base to 0.
+			// This causes strconv to eat the 0x and set base to 16.
+			base = 0
 		}
-		// We specify the base explicitly, which means strconv chokes
-		// on a leading 0x. Maybe we should defer more of the checks
-		// to strconv rather than hacking around it.
-		r.PopMark()
-		r.PushMark()
 	default:
 		return 0, fmt.Errorf("invalid base: %d", base)
 	}
