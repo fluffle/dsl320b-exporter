@@ -9,18 +9,28 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"strconv"
+	"sync"
 
 	"github.com/golang/glog"
 )
 
 type Reader struct {
-	buf []byte
+	// Since we are now reading and writing (and growing and indexing)
+	// the buffer from two different goroutines, we need to ensure that
+	// accesses of the readers and grow are mutually exclusive. Fffuuuu.
+	mu sync.Mutex
+	// We strobe this channel every time fill() reads more data, so that
+	// our various reading routines can wait for it.
+	ch  chan bool
 	rd  io.Reader // reader provided by the client
 	err error
+
+	buf []byte
 	// buf read, operate and write positions
 	// The invariant 0 <= r <= p <= w <= len(buf) should always hold.
 	r, p, w int
@@ -29,6 +39,10 @@ type Reader struct {
 	// started scanning from, and these pointers need to stay correct
 	// across calls to fill and grow.
 	m []int
+
+	// Provided by the thing that created the reader, so that the
+	// reader can signal it's done reading.
+	cancel context.CancelFunc
 }
 
 const (
@@ -39,7 +53,6 @@ const (
 
 var (
 	ErrTooLarge      = errors.New("Reader: tried to grow buffer too large")
-	ErrBufferFull    = errors.New("Reader: buffer full")
 	ErrNegativeCount = errors.New("Reader: negative read/peek size")
 	ErrAdvanceTooFar = errors.New("Reader: tried to advance past write pointer")
 	errNegativeRead  = errors.New("Reader: source returned negative count from Read")
@@ -47,35 +60,40 @@ var (
 )
 
 // NewReader returns a new Reader whose buffer has the default size.
-func NewReader(rd io.Reader) *Reader {
+// It is not useful without a call to Use() to set an underlying reader.
+func NewReader() *Reader {
 	return &Reader{
 		buf: make([]byte, bufSize),
-		rd:  rd,
+		m:   make([]int, 0),
 	}
 }
-
-// empty returns whether the unread portion of the buffer is empty.
-func (r *Reader) empty() bool { return r.w <= r.r }
-
-// Len returns the number of bytes of the unread portion of the buffer.
-func (r *Reader) Len() int { return r.w - r.p }
-
-// Cap returns the capacity of the buffer's underlying byte slice, that is, the
-// total space allocated for the buffer's data.
-func (r *Reader) Cap() int { return cap(r.buf) }
 
 // Reset resets the buffer to be empty,
 // but it retains the underlying storage for use by future writes.
 func (r *Reader) Reset() {
+	// No need to lock because fill() shouldn't be running at this
+	// point -- and we want to panic if it is!
+	r.err = nil
+	r.rd = nil
+	r.cancel = nil
 	r.buf = r.buf[:0]
 	r.m = r.m[:0]
 	r.r, r.p, r.w = 0, 0, 0
 }
 
+func (r *Reader) Use(rd io.Reader, cancel context.CancelFunc) {
+	// Ditto no lock because this starts fill up again.
+	r.rd = rd
+	r.ch = make(chan bool)
+	r.cancel = cancel
+	go r.fill()
+}
+
 // tryGrowByReslice is a inlineable version of grow for the fast-case where the
-// internal buffer only needs to be resliced.
+// internal buffer only needs to be resliced. It assumes the lock is held.
 // It returns the index where bytes should be written and whether it succeeded.
 func (r *Reader) tryGrowByReslice(n int) (int, bool) {
+	// Assumes lock is held by fill().
 	if n <= cap(r.buf)-r.w {
 		r.buf = r.buf[:r.w+n]
 		return r.w, true
@@ -87,9 +105,10 @@ func (r *Reader) tryGrowByReslice(n int) (int, bool) {
 // It returns the index where bytes should be written.
 // If the buffer can't grow it will panic with ErrTooLarge.
 func (r *Reader) grow(n int) int {
+	// Assumes lock is held by fill().
 	glog.V(2).Infoln("grow:", n)
 	// If we've read all the data, reset to recover space.
-	if r.r != 0 && r.empty() {
+	if r.r != 0 && r.w <= r.r {
 		r.Reset()
 	}
 	// Try to grow by means of a reslice.
@@ -97,9 +116,9 @@ func (r *Reader) grow(n int) int {
 		return i
 	}
 	c := cap(r.buf)
-	if n <= c/2-r.Len() {
+	if n <= c/2-(r.w-r.p) {
 		// We can slide things down instead of allocating a new
-		// slice. We only need Len+n <= c to slide, but
+		// slice. We only need (r.w - r.p) + n <= c to slide, but
 		// we instead let capacity get twice as large so we
 		// don't spend all our time copying.
 		copy(r.buf, r.buf[r.r:r.w])
@@ -135,35 +154,72 @@ func makeSlice(n int) []byte {
 	return make([]byte, n)
 }
 
-// fill reads a new chunk into the buffer.
+// We want to be notified eagerly of an EOF due to the server dropping
+// our connection, but the "only" way to achieve this is to have something
+// constantly listening for data. So we run the body of fill() in a loop
+// and strobe a channel every time we read >0 bytes.
 func (r *Reader) fill() {
-	if r.w == len(r.buf) {
-		// Write pointer has hit end of current buffer,
-		r.grow(bufSize / 2)
-	}
+	for {
+		if r.rd == nil {
+			panic("fill: still running at reset!")
+		}
+		// Hold write lock across all buffer resize ops.
+		r.mu.Lock()
+		if r.w == len(r.buf) {
+			// Write pointer has hit end of current buffer,
+			r.grow(bufSize / 2)
+		}
+		r.mu.Unlock()
 
-	// Read new data: try a limited number of times.
-	for i := maxConsecutiveEmptyReads; i > 0; i-- {
+		// We can't hold the write lock here because we're expecting fill
+		// to be blocked in this read all the time. Fortunately we're
+		// reading into the remaining buffer after r.w, so nothing else
+		// should be touching that space.
 		n, err := r.rd.Read(r.buf[r.w:])
 		if n < 0 {
 			panic(errNegativeRead)
 		}
+		r.mu.Lock()
 		r.w += n
-		if err != nil {
-			r.err = err
-			return
-		}
+		r.mu.Unlock()
 		if n > 0 {
+			// We do a non-blocking send here because to detect EOF fill always
+			// needs to be blocking on Read. If nothing is awaiting new data
+			// then it's fine that the strobe will not be sent, we have
+			// buffered the data anyway and it can be read later.
+			select {
+			case r.ch <- true:
+			default:
+			}
+		}
+		if err != nil {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			// On errors we cancel the context.CancelFunc we were given and
+			// close the channel to signal that we've been disconnected.
+			close(r.ch)
+			r.cancel()
+			r.err = err
+			glog.Errorf("fill error: %v", err)
 			return
 		}
 	}
-	r.err = io.ErrNoProgress
 }
 
 func (r *Reader) readErr() error {
 	err := r.err
 	r.err = nil
 	return err
+}
+
+func (r *Reader) Len() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.w - r.p
+}
+
+func (r *Reader) More() bool {
+	return <-r.ch
 }
 
 // Done advances the read pointer to the operate pointer, allowing
@@ -175,16 +231,20 @@ func (r *Reader) readErr() error {
 // be kept in the buffer until it is no longer needed.
 // Done will panic if there are any markers on the marker stack.
 func (r *Reader) Done() {
+	r.mu.Lock()
 	if len(r.m) > 0 {
 		panic("done: advancing read pointer with active markers")
 	}
 	r.r = r.p
+	r.mu.Unlock()
 }
 
 // PushMark pushes the current position of the operate pointer onto the
 // marker stack for later retrieval.
 func (r *Reader) PushMark() {
+	r.mu.Lock()
 	r.m = append(r.m, r.p)
+	r.mu.Unlock()
 }
 
 // PopMark removes and returns a previously-pushed marker from the stack.
@@ -192,28 +252,47 @@ func (r *Reader) PopMark() (mark int) {
 	if len(r.m) == 0 {
 		panic("pop mark: no active markers")
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	l := len(r.m) - 1
 	r.m, mark = r.m[:l], r.m[l]
 	return mark
 }
 
+// MarkedBytes returns the bytes between the marker at the top of the stack and r.p.
+func (r *Reader) MarkedBytes(pop bool) []byte {
+	if len(r.m) == 0 {
+		panic("pop mark: no active markers")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	l := len(r.m) - 1
+	mark := r.m[l]
+	if pop {
+		r.m = r.m[:l]
+	}
+	return r.buf[mark:r.p]
+}
+
 // Peek returns the next n bytes without advancing the operate pointer.
 // The bytes stop being valid at the next read call. If Peek returns fewer
 // than n bytes, it also returns an error explaining why the read is short.
-// The error is ErrBufferFull if n is larger than b's buffer size.
 func (r *Reader) Peek(n int) ([]byte, error) {
 	if n < 0 {
 		return nil, ErrNegativeCount
 	}
 
-	for r.Len() < n && r.err == nil {
-		r.fill()
+	// Don't hold the lock while waiting for reads.
+	for r.Len() < n && r.More() {
 	}
 
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	var err error
-	if avail := r.Len(); avail < n {
+
+	if r.w-r.p < n {
 		// not enough data in buffer
-		n = avail
+		n = r.w - r.p
 		err = r.readErr()
 	}
 	return r.buf[r.p : r.p+n], err
@@ -223,7 +302,10 @@ func (r *Reader) Advance(n int) error {
 	if n < 0 {
 		return ErrNegativeCount
 	}
-	if n > r.Len() {
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n > r.w-r.p {
 		return ErrAdvanceTooFar
 	}
 	r.p += n
@@ -293,68 +375,87 @@ func (r *Reader) until(delim []byte, consume bool, skip bool) (read []byte, err 
 	if !skip {
 		r.PushMark()
 	}
+	var found bool
 	for {
-		// Search the unsearched parts of the buffer.
-		// glog.V(2).Infof("r=%d m=%v p=%d w=%d len=%d", r.r, r.m, r.p, r.w, len(r.buf))
-		if i := bytes.Index(r.buf[r.p:r.w], delim); i >= 0 {
-			r.p += i
-			if consume {
-				r.p += len(delim)
-			}
+		found, err = r.findDelim(delim, consume, skip)
+		if found || err != nil {
 			if !skip {
-				mark := r.PopMark()
-				read = r.buf[mark:r.p]
-			}
-			break
-		}
-
-		// We've searched the current buffer so move our operate pointer up.
-		r.p = r.w - len(delim) + 1
-		if skip {
-			// We don't care about the data so advance read pointer.
-			r.Done()
-		}
-
-		// Pending error?
-		if r.err != nil {
-			if !skip {
-				mark := r.PopMark()
 				// Return everything scanned so far.
-				read = r.buf[mark:r.p]
+				read = r.MarkedBytes(true)
 			}
-			err = r.readErr()
-			break
+			return
 		}
 
-		r.fill() // more data please!
+		// more data please!
+		if ok := r.More(); !ok {
+			// Oh noes we've hit EOF or similar
+			break
+		}
 	}
 	return
+}
+
+func (r *Reader) findDelim(delim []byte, consume bool, skip bool) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Search the unsearched parts of the buffer.
+	// glog.V(2).Infof("r=%d m=%v p=%d w=%d len=%d", r.r, r.m, r.p, r.w, len(r.buf))
+	if i := bytes.Index(r.buf[r.p:r.w], delim); i >= 0 {
+		r.p += i
+		if consume {
+			r.p += len(delim)
+		}
+		return true, nil
+	}
+
+	// We've searched the current buffer so move our operate pointer up.
+	r.p = r.w - len(delim) + 1
+	if skip {
+		// We don't care about the data so advance read pointer.
+		r.r = r.p
+	}
+
+	// Pending error?
+	return false, r.readErr()
 }
 
 func (r *Reader) scan(f byteScanner, skip bool) ([]byte, error) {
 	if !skip {
 		r.PushMark()
 	}
-	b, err := r.Peek(1)
-	for err == nil {
-		if len(b) == 0 {
-			err = errShortRead
+
+	var err error
+	for {
+		if r.Len() == 0 {
+			if ok := r.More(); !ok {
+				// EOF or something similar
+				err = r.readErr()
+				break
+			}
+		}
+		if ok := r.scanByteLocked(f, skip); !ok {
 			break
 		}
-		if !f(b[0]) {
-			break
-		}
-		r.Advance(1)
-		if skip {
-			r.Done()
-		}
-		b, err = r.Peek(1)
 	}
+	if !skip {
+		return r.MarkedBytes(true), err
+	}
+	return nil, err
+}
+
+func (r *Reader) scanByteLocked(f byteScanner, skip bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !f(r.buf[r.p]) {
+		return false
+	}
+	r.p++
 	if skip {
-		return nil, err
+		r.r++
 	}
-	mark := r.PopMark()
-	return r.buf[mark:r.p], err
+	return true
 }
 
 func (r *Reader) Scan(f byteScanner) ([]byte, error) {
@@ -406,8 +507,8 @@ func (r *Reader) Float64() (float64, error) {
 	// handles this case, I hope.
 	tryParseAtEOF := func(err error) (float64, error) {
 		if err == io.EOF {
+			f, err := strconv.ParseFloat(string(r.MarkedBytes(false)), 64)
 			mark := r.PopMark()
-			f, err := strconv.ParseFloat(string(r.buf[mark:r.p]), 64)
 			if err != nil {
 				r.p = mark
 				return 0, err
@@ -522,8 +623,8 @@ func (r *Reader) parseInt(base int, bitSize int) (int64, error) {
 		// Expected >0 digits for valid int, so mimic strconv's error.
 		return rewind(strconv.ErrSyntax)
 	}
+	i, err := strconv.ParseInt(string(r.MarkedBytes(false)), base, bitSize)
 	mark := r.PopMark()
-	i, err := strconv.ParseInt(string(r.buf[mark:r.p]), base, bitSize)
 	if err != nil {
 		r.p = mark
 		return 0, err
