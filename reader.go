@@ -15,6 +15,7 @@ import (
 	"io"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/golang/glog"
 )
@@ -219,7 +220,14 @@ func (r *Reader) Len() int {
 }
 
 func (r *Reader) More() bool {
-	return <-r.ch
+	select {
+	case read := <-r.ch:
+		return read
+	case <-time.After(5 * time.Second):
+		// TODO(fluffle): Lazy default timeout.
+		r.err = errors.New("timeout while waiting for more data")
+		return false
+	}
 }
 
 // Done advances the read pointer to the operate pointer, allowing
@@ -389,8 +397,12 @@ func (r *Reader) until(delim []byte, consume bool, skip bool) (read []byte, err 
 		// more data please!
 		if ok := r.More(); !ok {
 			// Oh noes we've hit EOF or similar
+			err = r.readErr()
 			break
 		}
+	}
+	if !skip {
+		r.p = r.PopMark()
 	}
 	return
 }
