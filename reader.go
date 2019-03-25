@@ -69,14 +69,20 @@ func NewReader() *Reader {
 	}
 }
 
-// Reset resets the buffer to be empty,
-// but it retains the underlying storage for use by future writes.
+// Reset resets the reader so it is ready to read
+// from a new underlying io.Reader when Use is called.
 func (r *Reader) Reset() {
 	// No need to lock because fill() shouldn't be running at this
 	// point -- and we want to panic if it is!
 	r.err = nil
 	r.rd = nil
 	r.cancel = nil
+	r.clearBuffer()
+}
+
+// clearBuffer resets the buffer to be empty,
+// but it retains the underlying storage for use by future writes.
+func (r *Reader) clearBuffer() {
 	r.buf = r.buf[:0]
 	r.m = r.m[:0]
 	r.r, r.p, r.w = 0, 0, 0
@@ -108,9 +114,9 @@ func (r *Reader) tryGrowByReslice(n int) (int, bool) {
 func (r *Reader) grow(n int) int {
 	// Assumes lock is held by fill().
 	glog.V(2).Infoln("grow:", n)
-	// If we've read all the data, reset to recover space.
+	// If we've read all the data, clear buffer to recover space.
 	if r.r != 0 && r.w <= r.r {
-		r.Reset()
+		r.clearBuffer()
 	}
 	// Try to grow by means of a reslice.
 	if i, ok := r.tryGrowByReslice(n); ok {
@@ -198,6 +204,12 @@ func (r *Reader) fill() {
 			defer r.mu.Unlock()
 			// On errors we cancel the context.CancelFunc we were given and
 			// close the channel to signal that we've been disconnected.
+			if r.rd == nil {
+				// We can have multiple fill() backed up on the lock.
+				// If we get here and rd is nil the reader has been reset
+				// while this fill was waiting on the lock, so bail out now.
+				return
+			}
 			close(r.ch)
 			r.cancel()
 			r.err = err

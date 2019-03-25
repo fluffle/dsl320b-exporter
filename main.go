@@ -20,7 +20,7 @@ import (
 )
 
 var (
-	port      = flag.Int("port", 9489, "Port to serve metrics on.")
+	hostPort  = flag.String("host_port", ":9489", "Port to serve metrics on.")
 	modemIP   = flag.String("modem_ip", "", "Internal IP of the modem.")
 	modemPort = flag.Int("modem_port", 23, "Port to telnet to.")
 	modemPass = flag.String("modem_pass", "", "Admin password for the modem.")
@@ -373,15 +373,22 @@ func (c *Conn) DumpDiags(diagFile string) error {
 
 func main() {
 	flag.Parse()
-	if *modemIP == "" || *modemPass == "" {
-		glog.Exit("--modem_ip and --modem_pass are both required.")
+	if *modemIP == "" {
+		glog.Exit("--modem_ip is a required flag.")
+	}
+	pass := *modemPass
+	if pass == "" {
+		pass = os.Getenv("MODEM_PASS")
+		if pass == "" {
+			glog.Exit("You must provide the admin password via --modem_pass or MODEM_PASS env var.")
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	conn := NewConn(
-		&http.Server{Addr: fmt.Sprintf(":%d", *port)},
+		&http.Server{Addr: *hostPort},
 		fmt.Sprintf("%s:%d", *modemIP, *modemPort),
-		*modemPass,
+		pass,
 		fmt.Sprintf("\r\n%s> ", *modemName))
 
 	go conn.ConnectLoop(ctx, cancel)
