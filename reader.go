@@ -252,11 +252,31 @@ func (r *Reader) More() bool {
 // Done will panic if there are any markers on the marker stack.
 func (r *Reader) Done() {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if len(r.m) > 0 {
 		panic("done: advancing read pointer with active markers")
 	}
 	r.r = r.p
-	r.mu.Unlock()
+}
+
+// SeekEnd moves both read and operate pointers to the write pointer.
+// It's for use when an error results in these pointers being in an
+// unexpected place in the stream. Throw it all away and start again,
+// without calling More to block for more data.
+// Note: We don't call clearBuffer here because that would move the
+// write pointer while fill is blocked on it, so we'd write to the
+// old location but read from the new. This would not work well...
+func (r *Reader) SeekEnd() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	glog.Warningf("seek end: dumping %d bytes of data", r.w-r.p)
+	if len(r.m) > 0 {
+		glog.Errorf("seek end: advancing read pointer with active markers, these will be dropped")
+	}
+	glog.V(2).Infof("buffer contents:\n\n%s\n\n", r.buf[r.p:r.w])
+	r.r = r.w
+	r.p = r.w
+	r.m = r.m[:0]
 }
 
 // PushMark pushes the current position of the operate pointer onto the

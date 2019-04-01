@@ -407,7 +407,7 @@ func main() {
 		glog.Exitf("Dumped diagnostics to %q", *diagFile)
 	}
 
-	agg := NewAggregator(
+	agg := NewAggregator(conn,
 		SysUptime(conn),
 		CPUStats(conn),
 		HeapStats(conn),

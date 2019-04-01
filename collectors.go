@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -18,17 +19,22 @@ const (
 // This won't play well with our telnet interface, so we register
 // a single Aggregator collector which serializes collection.
 type Aggregator struct {
-	c  []prometheus.Collector
-	mu sync.Mutex
+	conn *Conn
+	c    []prometheus.Collector
+	mu   sync.Mutex
 }
 
-func NewAggregator(coll ...prometheus.Collector) *Aggregator {
-	return &Aggregator{c: coll}
+func NewAggregator(conn *Conn, coll ...prometheus.Collector) *Aggregator {
+	return &Aggregator{conn: conn, c: coll}
 }
 
 func (agg *Aggregator) Describe(ch chan<- *prometheus.Desc) {
 	agg.mu.Lock()
 	defer agg.mu.Unlock()
+	if agg.conn.State() != CONNECTED {
+		glog.Warningln("agg: rejecting describe request while disconnected")
+		return
+	}
 	for _, coll := range agg.c {
 		coll.Describe(ch)
 	}
@@ -37,6 +43,10 @@ func (agg *Aggregator) Describe(ch chan<- *prometheus.Desc) {
 func (agg *Aggregator) Collect(ch chan<- prometheus.Metric) {
 	agg.mu.Lock()
 	defer agg.mu.Unlock()
+	if agg.conn.State() != CONNECTED {
+		glog.Warningln("agg: rejecting collect request while disconnected")
+		return
+	}
 	for _, coll := range agg.c {
 		coll.Collect(ch)
 	}
