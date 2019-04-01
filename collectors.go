@@ -31,10 +31,6 @@ func NewAggregator(conn *Conn, coll ...prometheus.Collector) *Aggregator {
 func (agg *Aggregator) Describe(ch chan<- *prometheus.Desc) {
 	agg.mu.Lock()
 	defer agg.mu.Unlock()
-	if agg.conn.State() != CONNECTED {
-		glog.Warningln("agg: rejecting describe request while disconnected")
-		return
-	}
 	for _, coll := range agg.c {
 		coll.Describe(ch)
 	}
