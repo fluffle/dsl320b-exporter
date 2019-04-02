@@ -64,7 +64,7 @@ func (c *Command) Describe(ch chan<- *prometheus.Desc) {
 // Collect executes the command and reads metric values from the response.
 func (c *Command) Collect(ch chan<- prometheus.Metric) {
 	if err := c.conn.WriteLine(c.Cmd); err != nil {
-		c.Fail("collect: write command %q failed: %v", c.Cmd, err)
+		glog.Errorf("collect: write command %q failed: %v", c.Cmd, err)
 		return
 	}
 	for _, m := range c.Metrics {
@@ -72,17 +72,9 @@ func (c *Command) Collect(ch chan<- prometheus.Metric) {
 		if err != nil {
 			// If we're in a bad position for one of the metrics, trying to seek
 			// forward to another will probably not go well, so bail out now.
-			c.Fail("collect: extract %s failed: %v", m.Ext, err)
+			glog.Errorf("collect: extract %s failed: %v", m.Ext, err)
 			return
 		}
 		ch <- metric
 	}
-	if err := c.conn.SeekPrompt(); err != nil {
-		c.Fail("collect: seek prompt failed: %v", err)
-	}
-}
-
-func (c *Command) Fail(fmt string, args ...interface{}) {
-	glog.Errorf(fmt, args...)
-	c.conn.r.SeekEnd()
 }

@@ -45,6 +45,15 @@ func (agg *Aggregator) Collect(ch chan<- prometheus.Metric) {
 	}
 	for _, coll := range agg.c {
 		coll.Collect(ch)
+		if err := agg.conn.SeekPrompt(); err != nil {
+			// If we can't correctly seek to the prompt after a collection
+			// completes, then the stream has gotten desynchronized from
+			// where the code expects it to be. To resynchronize, we wait
+			// for the modem to stop sending us data, then drop the contents
+			// of the buffer on the floor.
+			glog.Errorf("collect: seek prompt failed: %v", err)
+			agg.conn.r.Drain(true)
+		}
 	}
 }
 

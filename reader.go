@@ -53,11 +53,12 @@ const (
 )
 
 var (
-	ErrTooLarge      = errors.New("Reader: tried to grow buffer too large")
-	ErrNegativeCount = errors.New("Reader: negative read/peek size")
-	ErrAdvanceTooFar = errors.New("Reader: tried to advance past write pointer")
-	errNegativeRead  = errors.New("Reader: source returned negative count from Read")
-	errShortRead     = errors.New("Reader: source returned too few bytes")
+	ErrTimeout       = errors.New("reader: timeout while waiting for more data")
+	ErrTooLarge      = errors.New("reader: tried to grow buffer too large")
+	ErrNegativeCount = errors.New("reader: negative read/peek size")
+	ErrAdvanceTooFar = errors.New("reader: tried to advance past write pointer")
+	errNegativeRead  = errors.New("reader: source returned negative count from Read")
+	errShortRead     = errors.New("reader: source returned too few bytes")
 )
 
 // NewReader returns a new Reader whose buffer has the default size.
@@ -237,8 +238,34 @@ func (r *Reader) More() bool {
 		return read
 	case <-time.After(5 * time.Second):
 		// TODO(fluffle): Lazy default timeout.
-		r.err = errors.New("timeout while waiting for more data")
+		r.err = ErrTimeout
 		return false
+	}
+}
+
+// Drain returns when either the read channel is closed or
+// no new data is read for 500ms.
+func (r *Reader) Drain(drop bool) {
+	consecutive := 0
+	for {
+		select {
+		case read := <-r.ch:
+			if !read {
+				return
+			}
+			if consecutive > 0 {
+				glog.Warningln("drain: still receiving data...")
+				consecutive = 0
+			}
+		case <-time.After(100 * time.Millisecond):
+			consecutive++
+		}
+		if consecutive >= 5 {
+			if drop {
+				r.SeekEnd()
+			}
+			return
+		}
 	}
 }
 
@@ -269,14 +296,16 @@ func (r *Reader) Done() {
 func (r *Reader) SeekEnd() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	glog.Warningf("seek end: dumping %d bytes of data", r.w-r.p)
 	if len(r.m) > 0 {
 		glog.Errorf("seek end: advancing read pointer with active markers, these will be dropped")
+		r.m = r.m[:0]
 	}
-	glog.V(2).Infof("buffer contents:\n\n%s\n\n", r.buf[r.p:r.w])
+	if r.w-r.p > 0 {
+		glog.Warningf("seek end: dumping %d bytes of data", r.w-r.p)
+		glog.V(2).Infof("buffer contents:\n\n%s\n\n", r.buf[r.p:r.w])
+	}
 	r.r = r.w
 	r.p = r.w
-	r.m = r.m[:0]
 }
 
 // PushMark pushes the current position of the operate pointer onto the
