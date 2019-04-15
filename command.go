@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+
 	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -41,6 +43,13 @@ func (m Metric) ReadMetric(r *Reader) (prometheus.Metric, error) {
 	return prometheus.NewConstMetric(m.Desc, m.Type, f, append(m.Labels, labels...)...)
 }
 
+// We want to propagate errors back up from our collectors.
+type Collector interface {
+	fmt.Stringer
+	Describe(chan<- *prometheus.Desc)
+	Collect(chan<- prometheus.Metric) error
+}
+
 // A Command executes a single command via the telnet connection, then collects
 // each of its Metrics in order. If the order of Metrics and their Extractors
 // doesn't match the output of the command, you're gonna have a bad time!
@@ -62,19 +71,22 @@ func (c *Command) Describe(ch chan<- *prometheus.Desc) {
 }
 
 // Collect executes the command and reads metric values from the response.
-func (c *Command) Collect(ch chan<- prometheus.Metric) {
+func (c *Command) Collect(ch chan<- prometheus.Metric) error {
 	if err := c.conn.WriteLine(c.Cmd); err != nil {
-		glog.Errorf("collect: write command %q failed: %v", c.Cmd, err)
-		return
+		return fmt.Errorf("command %q write line failed: %v", c, err)
 	}
 	for _, m := range c.Metrics {
 		metric, err := m.ReadMetric(c.conn.r)
 		if err != nil {
 			// If we're in a bad position for one of the metrics, trying to seek
 			// forward to another will probably not go well, so bail out now.
-			glog.Errorf("collect: extract %s failed: %v", m.Ext, err)
-			return
+			return fmt.Errorf("command %q extract %s failed: %v", c, m.Ext, err)
 		}
 		ch <- metric
 	}
+	return nil
+}
+
+func (c *Command) String() string {
+	return c.Cmd
 }

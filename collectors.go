@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
@@ -15,45 +16,159 @@ const (
 	Gauge   prometheus.ValueType = prometheus.GaugeValue
 )
 
+type latencyMeasure struct {
+	sum, cnt, err float64
+}
+
+type latencyTracker struct {
+	// Total* and Collect are called outside of the semaphore
+	// that prevents concurrent collections, so we need a lock.
+	mu                           *sync.Mutex
+	totalSum, totalCnt, totalErr *prometheus.Desc
+	cmdSum, cmdCnt, cmdErr       *prometheus.Desc
+	total                        latencyMeasure
+	perCmd                       map[string]latencyMeasure
+}
+
+func newLatencyTracker() latencyTracker {
+	return latencyTracker{
+		mu:       &sync.Mutex{},
+		totalSum: NewDesc("collect_latency_seconds_overall_sum", "Overall count of seconds spent collecting."),
+		totalCnt: NewDesc("collect_latency_seconds_total_count", "Overall count of collections."),
+		totalErr: NewDesc("collect_error_count", "Overall count of collection errors."),
+		cmdSum:   NewDesc("command_collect_latency_seconds_overall_sum", "Count of seconds spent collecting per-command.", "command"),
+		cmdCnt:   NewDesc("command_collect_latency_seconds_total_count", "Count of collections per-command", "command"),
+		cmdErr:   NewDesc("command_collect_error_count", "Count of collection errors per-command", "command"),
+		perCmd:   make(map[string]latencyMeasure),
+	}
+}
+
+func (lt latencyTracker) Total(secs float64) {
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+	lt.total.sum += secs
+	lt.total.cnt += 1
+}
+
+func (lt latencyTracker) TotalErr() {
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+	lt.total.err += 1
+}
+
+func (lt latencyTracker) Cmd(cmd string, secs float64) {
+	m := lt.perCmd[cmd]
+	m.sum += secs
+	m.cnt += 1
+	lt.perCmd[cmd] = m
+}
+
+func (lt latencyTracker) CmdErr(cmd string) {
+	m := lt.perCmd[cmd]
+	m.err += 1
+	lt.perCmd[cmd] = m
+}
+
+func (lt latencyTracker) Describe(ch chan<- *prometheus.Desc) {
+	for _, d := range []*prometheus.Desc{
+		lt.totalSum, lt.totalCnt, lt.totalErr, lt.cmdSum, lt.cmdCnt, lt.cmdErr,
+	} {
+		ch <- d
+	}
+}
+
+func (lt latencyTracker) Collect(ch chan<- prometheus.Metric) {
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+	ch <- prometheus.MustNewConstMetric(lt.totalSum, Counter, lt.total.sum)
+	ch <- prometheus.MustNewConstMetric(lt.totalCnt, Counter, lt.total.cnt)
+	ch <- prometheus.MustNewConstMetric(lt.totalErr, Counter, lt.total.err)
+	for cmd, m := range lt.perCmd {
+		ch <- prometheus.MustNewConstMetric(lt.cmdSum, Counter, m.sum, cmd)
+		ch <- prometheus.MustNewConstMetric(lt.cmdCnt, Counter, m.cnt, cmd)
+		ch <- prometheus.MustNewConstMetric(lt.cmdErr, Counter, m.err, cmd)
+	}
+}
+
 // The Prometheus client library performs collection concurrently.
 // This won't play well with our telnet interface, so we register
 // a single Aggregator collector which serializes collection.
 type Aggregator struct {
 	conn *Conn
-	c    []prometheus.Collector
-	mu   sync.Mutex
+	c    []Collector
+	sem  chan struct{}
+	lt   latencyTracker
 }
 
-func NewAggregator(conn *Conn, coll ...prometheus.Collector) *Aggregator {
-	return &Aggregator{conn: conn, c: coll}
+func NewAggregator(conn *Conn, coll ...Collector) *Aggregator {
+	return &Aggregator{
+		conn: conn,
+		c:    coll,
+		sem:  make(chan struct{}, 1),
+		lt:   newLatencyTracker(),
+	}
 }
 
 func (agg *Aggregator) Describe(ch chan<- *prometheus.Desc) {
-	agg.mu.Lock()
-	defer agg.mu.Unlock()
 	for _, coll := range agg.c {
 		coll.Describe(ch)
 	}
+	agg.lt.Describe(ch)
 }
 
 func (agg *Aggregator) Collect(ch chan<- prometheus.Metric) {
-	agg.mu.Lock()
-	defer agg.mu.Unlock()
+	totalStart := time.Now()
+	defer func() {
+		agg.lt.Total(time.Since(totalStart).Seconds())
+		agg.lt.Collect(ch)
+	}()
+
 	if agg.conn.State() != CONNECTED {
 		glog.Warningln("agg: rejecting collect request while disconnected")
+		agg.lt.TotalErr()
 		return
 	}
+	select {
+	case agg.sem <- struct{}{}:
+		agg.collect(ch)
+		<-agg.sem
+	default:
+		glog.Warningln("agg: rejecting collect request because one is already in-flight")
+		agg.lt.TotalErr()
+	}
+}
+
+func (agg *Aggregator) collect(ch chan<- prometheus.Metric) {
 	for _, coll := range agg.c {
-		coll.Collect(ch)
-		if err := agg.conn.SeekPrompt(); err != nil {
-			// If we can't correctly seek to the prompt after a collection
-			// completes, then the stream has gotten desynchronized from
-			// where the code expects it to be. To resynchronize, we wait
-			// for the modem to stop sending us data, then drop the contents
-			// of the buffer on the floor.
-			glog.Errorf("collect: seek prompt failed: %v", err)
+		cmdStart := time.Now()
+		err := coll.Collect(ch)
+		if err == nil {
+			if err = agg.conn.SeekPrompt(); err != nil {
+				err = fmt.Errorf("command %q seek prompt failed: %v", coll, err)
+			}
+		}
+		if err != nil {
+			// If we got an error from collection, or can't find the prompt
+			// after a collection completes, then the stream has become
+			// desynchronized from where the code expects it to be. To
+			// resynchronize, we wait for the modem to stop sending us data,
+			// then drop the contents of the buffer on the floor. The next
+			// collector then starts with a clean slate.
+			glog.Errorf("collect: %v", err)
+			agg.lt.CmdErr(coll.String())
+			// Sometimes, it looks like the modem simply doesn't flush some
+			// of the data we're waiting for to us until we send some more
+			// data. The pathology looks like:
+			//   - Command a times out while waiting for expected data.
+			//   - Drain dumps a few (e.g. 8) bytes that are not expected.
+			//   - Writing the next command fails because instead of e.g.
+			//     "wan hwsar disp\r\n" being echoed back to us, we get
+			//     "wmodem> an hwsar disp\r\n".
+			// So, we send \r\n before draining the buffer.
+			agg.conn.WriteLine("")
 			agg.conn.r.Drain(true)
 		}
+		agg.lt.Cmd(coll.String(), time.Since(cmdStart).Seconds())
 	}
 }
 

@@ -156,11 +156,11 @@ type CPUUsage struct{}
 
 func (_ CPUUsage) Extract(r *Reader) (float64, []string, error) {
 	if err := r.SeekPast("baseline "); err != nil {
-		return 0, nil, err
+		return 0, nil, fmt.Errorf("seek past baseline: %v", err)
 	}
 	base, err := r.Float64()
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, fmt.Errorf("extract baseline ticks: %v", err)
 	}
 
 	sum := float64(0)
@@ -168,11 +168,11 @@ func (_ CPUUsage) Extract(r *Reader) (float64, []string, error) {
 	for i := 0; i < 63; i++ {
 		ident := fmt.Sprintf(" %2d ", i)
 		if err := r.SeekPast(ident); err != nil {
-			return 0, nil, err
+			return 0, nil, fmt.Errorf("seek past %q: %v", ident, err)
 		}
 		idle, err := r.Float64()
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, fmt.Errorf("extract %q ticks: %v", ident, err)
 		}
 		sum += base - idle
 	}

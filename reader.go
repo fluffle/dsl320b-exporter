@@ -236,7 +236,7 @@ func (r *Reader) More() bool {
 	select {
 	case read := <-r.ch:
 		return read
-	case <-time.After(5 * time.Second):
+	case <-time.After(2 * time.Second):
 		// TODO(fluffle): Lazy default timeout.
 		r.err = ErrTimeout
 		return false
@@ -254,7 +254,6 @@ func (r *Reader) Drain(drop bool) {
 				return
 			}
 			if consecutive > 0 {
-				glog.Warningln("drain: still receiving data...")
 				consecutive = 0
 			}
 		case <-time.After(100 * time.Millisecond):
@@ -302,7 +301,7 @@ func (r *Reader) SeekEnd() {
 	}
 	if r.w-r.p > 0 {
 		glog.Warningf("seek end: dumping %d bytes of data", r.w-r.p)
-		glog.V(2).Infof("buffer contents:\n\n%s\n\n", r.buf[r.p:r.w])
+		glog.Warningf("buffer contents:\n\n%s\n\n", r.buf[r.p:r.w])
 	}
 	r.r = r.w
 	r.p = r.w
