@@ -23,16 +23,16 @@ type latencyMeasure struct {
 type latencyTracker struct {
 	// Total* and Collect are called outside of the semaphore
 	// that prevents concurrent collections, so we need a lock.
-	mu                           *sync.Mutex
+	mu                           sync.Mutex
 	totalSum, totalCnt, totalErr *prometheus.Desc
 	cmdSum, cmdCnt, cmdErr       *prometheus.Desc
 	total                        latencyMeasure
 	perCmd                       map[string]latencyMeasure
 }
 
-func newLatencyTracker() latencyTracker {
-	return latencyTracker{
-		mu:       &sync.Mutex{},
+func newLatencyTracker() *latencyTracker {
+	return &latencyTracker{
+		mu:       sync.Mutex{},
 		totalSum: NewDesc("collect_latency_seconds_overall_sum", "Overall count of seconds spent collecting."),
 		totalCnt: NewDesc("collect_latency_seconds_total_count", "Overall count of collections."),
 		totalErr: NewDesc("collect_error_count", "Overall count of collection errors."),
@@ -43,33 +43,33 @@ func newLatencyTracker() latencyTracker {
 	}
 }
 
-func (lt latencyTracker) Total(secs float64) {
+func (lt *latencyTracker) Total(secs float64) {
 	lt.mu.Lock()
 	defer lt.mu.Unlock()
 	lt.total.sum += secs
 	lt.total.cnt += 1
 }
 
-func (lt latencyTracker) TotalErr() {
+func (lt *latencyTracker) TotalErr() {
 	lt.mu.Lock()
 	defer lt.mu.Unlock()
 	lt.total.err += 1
 }
 
-func (lt latencyTracker) Cmd(cmd string, secs float64) {
+func (lt *latencyTracker) Cmd(cmd string, secs float64) {
 	m := lt.perCmd[cmd]
 	m.sum += secs
 	m.cnt += 1
 	lt.perCmd[cmd] = m
 }
 
-func (lt latencyTracker) CmdErr(cmd string) {
+func (lt *latencyTracker) CmdErr(cmd string) {
 	m := lt.perCmd[cmd]
 	m.err += 1
 	lt.perCmd[cmd] = m
 }
 
-func (lt latencyTracker) Describe(ch chan<- *prometheus.Desc) {
+func (lt *latencyTracker) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{
 		lt.totalSum, lt.totalCnt, lt.totalErr, lt.cmdSum, lt.cmdCnt, lt.cmdErr,
 	} {
@@ -77,7 +77,7 @@ func (lt latencyTracker) Describe(ch chan<- *prometheus.Desc) {
 	}
 }
 
-func (lt latencyTracker) Collect(ch chan<- prometheus.Metric) {
+func (lt *latencyTracker) Collect(ch chan<- prometheus.Metric) {
 	lt.mu.Lock()
 	defer lt.mu.Unlock()
 	ch <- prometheus.MustNewConstMetric(lt.totalSum, Counter, lt.total.sum)
@@ -95,16 +95,16 @@ func (lt latencyTracker) Collect(ch chan<- prometheus.Metric) {
 // a single Aggregator collector which serializes collection.
 type Aggregator struct {
 	conn *Conn
+	dl   time.Duration
 	c    []Collector
-	sem  chan struct{}
-	lt   latencyTracker
+	lt   *latencyTracker
 }
 
-func NewAggregator(conn *Conn, coll ...Collector) *Aggregator {
+func NewAggregator(conn *Conn, deadline time.Duration, coll ...Collector) *Aggregator {
 	return &Aggregator{
 		conn: conn,
+		dl:   deadline,
 		c:    coll,
-		sem:  make(chan struct{}, 1),
 		lt:   newLatencyTracker(),
 	}
 }
@@ -128,18 +128,15 @@ func (agg *Aggregator) Collect(ch chan<- prometheus.Metric) {
 		agg.lt.TotalErr()
 		return
 	}
-	select {
-	case agg.sem <- struct{}{}:
-		agg.collect(ch)
-		<-agg.sem
-	default:
-		glog.Warningln("agg: rejecting collect request because one is already in-flight")
-		agg.lt.TotalErr()
-	}
-}
 
-func (agg *Aggregator) collect(ch chan<- prometheus.Metric) {
 	for _, coll := range agg.c {
+		if time.Since(totalStart) > agg.dl {
+			// promhttp Timeout option doesn't actually cancel
+			// the scrape, so we implement our own here.
+			glog.Warningln("agg: hit scrape deadline")
+			agg.lt.TotalErr()
+			return
+		}
 		cmdStart := time.Now()
 		err := coll.Collect(ch)
 		if err == nil {
@@ -156,16 +153,6 @@ func (agg *Aggregator) collect(ch chan<- prometheus.Metric) {
 			// collector then starts with a clean slate.
 			glog.Errorf("collect: %v", err)
 			agg.lt.CmdErr(coll.String())
-			// Sometimes, it looks like the modem simply doesn't flush some
-			// of the data we're waiting for to us until we send some more
-			// data. The pathology looks like:
-			//   - Command a times out while waiting for expected data.
-			//   - Drain dumps a few (e.g. 8) bytes that are not expected.
-			//   - Writing the next command fails because instead of e.g.
-			//     "wan hwsar disp\r\n" being echoed back to us, we get
-			//     "wmodem> an hwsar disp\r\n".
-			// So, we send \r\n before draining the buffer.
-			agg.conn.WriteLine("")
 			agg.conn.r.Drain(true)
 		}
 		agg.lt.Cmd(coll.String(), time.Since(cmdStart).Seconds())

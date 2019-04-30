@@ -20,12 +20,13 @@ import (
 )
 
 var (
-	hostPort  = flag.String("host_port", ":9489", "Port to serve metrics on.")
-	modemIP   = flag.String("modem_ip", "", "Internal IP of the modem.")
-	modemPort = flag.Int("modem_port", 23, "Port to telnet to.")
-	modemPass = flag.String("modem_pass", "", "Admin password for the modem.")
-	modemName = flag.String("modem_hostname", "tc", "Hostname for modem.")
-	diagFile  = flag.String("diag_file", "", "Dump diag to this file.")
+	hostPort       = flag.String("host_port", ":9489", "Port to serve metrics on.")
+	modemIP        = flag.String("modem_ip", "", "Internal IP of the modem.")
+	modemPort      = flag.Int("modem_port", 23, "Port to telnet to.")
+	modemPass      = flag.String("modem_pass", "", "Admin password for the modem.")
+	modemName      = flag.String("modem_hostname", "tc", "Hostname for modem.")
+	diagFile       = flag.String("diag_file", "", "Dump diag to this file.")
+	scrapeDeadline = flag.Duration("scrape_deadline", 23*time.Second, "Cancel scrapes that take longer than this.")
 
 	// An invalid password is misconfiguration that should prevent the
 	// reconnection loop from running.
@@ -371,6 +372,12 @@ func (c *Conn) DumpDiags(diagFile string) error {
 	return nil
 }
 
+type logAdapter struct{}
+
+func (_ logAdapter) Println(v ...interface{}) {
+	glog.Infoln(append([]interface{}{"prometheus:"}, v...))
+}
+
 func main() {
 	flag.Parse()
 	if *modemIP == "" {
@@ -407,7 +414,7 @@ func main() {
 		glog.Exitf("Dumped diagnostics to %q", *diagFile)
 	}
 
-	agg := NewAggregator(conn,
+	agg := NewAggregator(conn, *scrapeDeadline,
 		SysUptime(conn),
 		CPUStats(conn),
 		HeapStats(conn),
@@ -424,7 +431,13 @@ func main() {
 	)
 	prometheus.MustRegister(agg)
 
-	http.Handle("/metrics", promhttp.Handler())
+	opts := promhttp.HandlerOpts{
+		ErrorLog:            logAdapter{},
+		MaxRequestsInFlight: 1,
+	}
+	h := promhttp.InstrumentMetricHandler(prometheus.DefaultRegisterer,
+		promhttp.HandlerFor(prometheus.DefaultGatherer, opts))
+	http.Handle("/metrics", h)
 	http.HandleFunc("/quitquitquit", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "Shut down!")
 		if f, ok := w.(http.Flusher); ok {

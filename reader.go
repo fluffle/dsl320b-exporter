@@ -24,10 +24,7 @@ type Reader struct {
 	// Since we are now reading and writing (and growing and indexing)
 	// the buffer from two different goroutines, we need to ensure that
 	// accesses of the readers and grow are mutually exclusive. Fffuuuu.
-	mu sync.Mutex
-	// We strobe this channel every time fill() reads more data, so that
-	// our various reading routines can wait for it.
-	ch  chan bool
+	mu  sync.Mutex
 	rd  io.Reader // reader provided by the client
 	err error
 
@@ -44,6 +41,11 @@ type Reader struct {
 	// Provided by the thing that created the reader, so that the
 	// reader can signal it's done reading.
 	cancel context.CancelFunc
+
+	// Map of channels for reader code to signify that it is interested
+	// in knowing that more data has arrived, or to block on until it
+	// does, if it has not already arrived.
+	await map[chan bool]bool
 }
 
 const (
@@ -65,8 +67,9 @@ var (
 // It is not useful without a call to Use() to set an underlying reader.
 func NewReader() *Reader {
 	return &Reader{
-		buf: make([]byte, bufSize),
-		m:   make([]int, 0),
+		buf:   make([]byte, bufSize),
+		m:     make([]int, 0),
+		await: make(map[chan bool]bool),
 	}
 }
 
@@ -92,7 +95,6 @@ func (r *Reader) clearBuffer() {
 func (r *Reader) Use(rd io.Reader, cancel context.CancelFunc) {
 	// Ditto no lock because this starts fill up again.
 	r.rd = rd
-	r.ch = make(chan bool)
 	r.cancel = cancel
 	go r.fill()
 }
@@ -165,7 +167,7 @@ func makeSlice(n int) []byte {
 // We want to be notified eagerly of an EOF due to the server dropping
 // our connection, but the "only" way to achieve this is to have something
 // constantly listening for data. So we run the body of fill() in a loop
-// and strobe a channel every time we read >0 bytes.
+// and notify other goroutines of new data via AwaitData channels.
 func (r *Reader) fill() {
 	for {
 		if r.rd == nil {
@@ -187,19 +189,16 @@ func (r *Reader) fill() {
 		if n < 0 {
 			panic(errNegativeRead)
 		}
+
 		r.mu.Lock()
 		r.w += n
-		r.mu.Unlock()
-		if n > 0 {
-			// We do a non-blocking send here because to detect EOF fill always
-			// needs to be blocking on Read. If nothing is awaiting new data
-			// then it's fine that the strobe will not be sent, we have
-			// buffered the data anyway and it can be read later.
-			select {
-			case r.ch <- true:
-			default:
-			}
+		for ch := range r.await {
+			ch <- true
+			close(ch)
+			delete(r.await, ch)
 		}
+		r.mu.Unlock()
+
 		if err != nil {
 			r.mu.Lock()
 			defer r.mu.Unlock()
@@ -211,7 +210,10 @@ func (r *Reader) fill() {
 				// while this fill was waiting on the lock, so bail out now.
 				return
 			}
-			close(r.ch)
+			for ch := range r.await {
+				close(ch)
+				delete(r.await, ch)
+			}
 			r.cancel()
 			r.err = err
 			glog.Errorf("fill error: %v", err)
@@ -226,31 +228,24 @@ func (r *Reader) readErr() error {
 	return err
 }
 
-func (r *Reader) Len() int {
+func (r *Reader) AwaitData() <-chan bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.w - r.p
+	ch := make(chan bool, 1)
+	r.await[ch] = true
+	return ch
 }
 
-func (r *Reader) More() bool {
-	select {
-	case read := <-r.ch:
-		return read
-	case <-time.After(2 * time.Second):
-		// TODO(fluffle): Lazy default timeout.
-		r.err = ErrTimeout
-		return false
-	}
-}
-
-// Drain returns when either the read channel is closed or
-// no new data is read for 500ms.
+// Drain polls and returns when no new data is read for 500ms.
+// If drop is true, it will call SeekEnd() to throw away any unread data.
 func (r *Reader) Drain(drop bool) {
 	consecutive := 0
 	for {
+		ch := r.AwaitData()
 		select {
-		case read := <-r.ch:
+		case read := <-ch:
 			if !read {
+				// fill is exiting, we should too!
 				return
 			}
 			if consecutive > 0 {
@@ -266,6 +261,28 @@ func (r *Reader) Drain(drop bool) {
 			return
 		}
 	}
+}
+
+// SeekEnd moves both read and operate pointers to the write pointer.
+// It's for use when an error results in these pointers being in an
+// unexpected place in the stream. Throw it all away and start again,
+// without blocking for more data.
+// Note: We don't call clearBuffer here because that would move the
+// write pointer while fill is blocked on it, so we'd write to the
+// old location but read from the new. This would not work well...
+func (r *Reader) SeekEnd() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.m) > 0 {
+		glog.Errorf("seek end: advancing read pointer with active markers, these will be dropped")
+		r.m = r.m[:0]
+	}
+	if r.w-r.p > 0 {
+		glog.Warningf("seek end: dumping %d bytes of data", r.w-r.p)
+		glog.V(2).Infof("buffer contents:\n\n%s\n\n", r.buf[r.p:r.w])
+	}
+	r.r = r.w
+	r.p = r.w
 }
 
 // Done advances the read pointer to the operate pointer, allowing
@@ -285,28 +302,6 @@ func (r *Reader) Done() {
 	r.r = r.p
 }
 
-// SeekEnd moves both read and operate pointers to the write pointer.
-// It's for use when an error results in these pointers being in an
-// unexpected place in the stream. Throw it all away and start again,
-// without calling More to block for more data.
-// Note: We don't call clearBuffer here because that would move the
-// write pointer while fill is blocked on it, so we'd write to the
-// old location but read from the new. This would not work well...
-func (r *Reader) SeekEnd() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(r.m) > 0 {
-		glog.Errorf("seek end: advancing read pointer with active markers, these will be dropped")
-		r.m = r.m[:0]
-	}
-	if r.w-r.p > 0 {
-		glog.Warningf("seek end: dumping %d bytes of data", r.w-r.p)
-		glog.Warningf("buffer contents:\n\n%s\n\n", r.buf[r.p:r.w])
-	}
-	r.r = r.w
-	r.p = r.w
-}
-
 // PushMark pushes the current position of the operate pointer onto the
 // marker stack for later retrieval.
 func (r *Reader) PushMark() {
@@ -317,11 +312,11 @@ func (r *Reader) PushMark() {
 
 // PopMark removes and returns a previously-pushed marker from the stack.
 func (r *Reader) PopMark() (mark int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if len(r.m) == 0 {
 		panic("pop mark: no active markers")
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	l := len(r.m) - 1
 	r.m, mark = r.m[:l], r.m[l]
 	return mark
@@ -329,17 +324,25 @@ func (r *Reader) PopMark() (mark int) {
 
 // MarkedBytes returns the bytes between the marker at the top of the stack and r.p.
 func (r *Reader) MarkedBytes(pop bool) []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if len(r.m) == 0 {
 		panic("pop mark: no active markers")
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	l := len(r.m) - 1
 	mark := r.m[l]
 	if pop {
 		r.m = r.m[:l]
 	}
 	return r.buf[mark:r.p]
+}
+
+// Len returns the number of bytes between the operate pointer and the write
+// pointer.
+func (r *Reader) Len() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.w - r.p
 }
 
 // Peek returns the next n bytes without advancing the operate pointer.
@@ -351,7 +354,12 @@ func (r *Reader) Peek(n int) ([]byte, error) {
 	}
 
 	// Don't hold the lock while waiting for reads.
-	for r.Len() < n && r.More() {
+	for {
+		ch := r.AwaitData()
+		if r.Len() >= n || !<-ch {
+			// Channel closed without data received => fill exiting.
+			break
+		}
 	}
 
 	r.mu.Lock()
@@ -445,7 +453,14 @@ func (r *Reader) until(delim []byte, consume bool, skip bool) (read []byte, err 
 	}
 	var found bool
 	for {
+		// We create our notification channel before entering findDelim to
+		// prevent a race condition where new data arrives while findDelim
+		// is holding the lock. If this occurs, a call to AwaitData after
+		// findDelim will sometimes lose the race with fill() to get the lock,
+		// and the channel will not be notified that more data can be read.
+		ch := r.AwaitData()
 		found, err = r.findDelim(delim, consume, skip)
+
 		if found || err != nil {
 			if !skip {
 				// Return everything scanned so far.
@@ -454,8 +469,7 @@ func (r *Reader) until(delim []byte, consume bool, skip bool) (read []byte, err 
 			return
 		}
 
-		// more data please!
-		if ok := r.More(); !ok {
+		if ok := <-ch; !ok {
 			// Oh noes we've hit EOF or similar
 			err = r.readErr()
 			break
@@ -500,11 +514,15 @@ func (r *Reader) scan(f byteScanner, skip bool) ([]byte, error) {
 	var err error
 	for {
 		if r.Len() == 0 {
-			if ok := r.More(); !ok {
-				// EOF or something similar
-				err = r.readErr()
-				break
+			// Try to avoid creating lots of garbage channels by only
+			// awaiting when len is already 0.
+			ch := r.AwaitData()
+			if r.Len() > 0 || <-ch {
+				continue
 			}
+			// EOF or something similar
+			err = r.readErr()
+			break
 		}
 		if ok := r.scanByteLocked(f, skip); !ok {
 			break
