@@ -171,8 +171,9 @@ func NoiseMargin(conn *Conn, up bool) *Command {
 	marginDesc := NewDesc("noise_margin_db", "SNR margin, in dB", "direction")
 	attenDesc := NewDesc("line_attenuation_db", "Line attenuation, in dB", "direction")
 	return &Command{
-		conn: conn,
-		Cmd:  cmd,
+		conn:   conn,
+		Cmd:    cmd,
+		WhenUp: true,
 		Metrics: []Metric{
 			NewMetric(FloatAfter("noise margin "+dir+": "), marginDesc, Gauge, dir),
 			NewMetric(FloatAfter("attenuation "+dir+": "), attenDesc, Gauge, dir),
@@ -184,8 +185,9 @@ func NoiseMargin(conn *Conn, up bool) *Command {
 func SyncRate(conn *Conn) *Command {
 	syncDesc := NewDesc("line_sync_rate_kbps", "Line sync rate, in kbps", "direction", "channel_type")
 	return &Command{
-		conn: conn,
-		Cmd:  "wan adsl chandata",
+		conn:   conn,
+		Cmd:    "wan adsl chandata",
+		WhenUp: true,
 		Metrics: []Metric{
 			NewMetric(FloatAfter("near-end interleaved channel bit rate: "),
 				syncDesc, Gauge, "downstream", "interleaved"),
@@ -225,8 +227,9 @@ func ADSLStatus(conn *Conn) *Command {
 func ADSLMode(conn *Conn) *Command {
 	modeDesc := NewDesc("adsl_modem_operating_mode", "Current ADSL modem operating mode", "mode")
 	return &Command{
-		conn: conn,
-		Cmd:  "wan adsl opmode",
+		conn:   conn,
+		Cmd:    "wan adsl opmode",
+		WhenUp: true,
 		Metrics: []Metric{
 			NewMetric(StringAfter("operational mode: "), modeDesc, Gauge),
 		},
@@ -255,8 +258,9 @@ func ADSLErrors(conn *Conn) *Command {
 	}
 
 	return &Command{
-		conn: conn,
-		Cmd:  "wan adsl perfdata",
+		conn:   conn,
+		Cmd:    "wan adsl perfdata",
+		WhenUp: true,
 		Metrics: append(metrics,
 			NewMetric(FloatAfter("Error second after power-up\t: "),
 				errSecDesc, Counter),
@@ -268,8 +272,9 @@ func ATMCells(conn *Conn) *Command {
 	cellsDesc := NewDesc("atm_cell_count", "The number of ATM cells received or transmitted", "direction", "channel_type")
 
 	return &Command{
-		conn: conn,
-		Cmd:  "wan adsl cellcnt",
+		conn:   conn,
+		Cmd:    "wan adsl cellcnt",
+		WhenUp: true,
 		Metrics: []Metric{
 			NewMetric(FloatAfter("ActiveRxCellsFast        = "),
 				cellsDesc, Counter, "downstream", "fast"),

@@ -279,7 +279,7 @@ func (r *Reader) SeekEnd() {
 	}
 	if r.w-r.p > 0 {
 		glog.Warningf("seek end: dumping %d bytes of data", r.w-r.p)
-		glog.V(2).Infof("buffer contents:\n\n%s\n\n", r.buf[r.p:r.w])
+		glog.Infof("buffer contents:\n\n%s\n\n", r.buf[r.p:r.w])
 	}
 	r.r = r.w
 	r.p = r.w

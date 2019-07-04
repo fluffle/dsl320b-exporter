@@ -56,6 +56,7 @@ type Collector interface {
 type Command struct {
 	conn    *Conn
 	Cmd     string
+	WhenUp  bool // Command returns "adsl modem not up" when ADSL is down.
 	Metrics []Metric
 }
 
@@ -74,6 +75,12 @@ func (c *Command) Describe(ch chan<- *prometheus.Desc) {
 func (c *Command) Collect(ch chan<- prometheus.Metric) error {
 	if err := c.conn.WriteLine(c.Cmd); err != nil {
 		return fmt.Errorf("command %q write line failed: %v", c, err)
+	}
+	if c.WhenUp {
+		if err := c.conn.Expect("adsl modem not up"); err == nil {
+			// ADSL is down, this command will not produce data.
+			return nil
+		}
 	}
 	for _, m := range c.Metrics {
 		metric, err := m.ReadMetric(c.conn.r)
